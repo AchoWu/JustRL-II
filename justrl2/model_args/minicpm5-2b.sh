@@ -24,4 +24,9 @@ MODEL_ARGS=(
    --no-rope-fusion
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
+   # Gradient accumulation fusion needs apex's fused_weight_gradient_mlp_cuda extension.
+   # On the bare-metal cu12 stack that extension is ABI-broken against torch 2.13 (same
+   # c10::impl::cow::materialize_cow_storage break as flash-attn), so set
+   # NO_GRAD_ACC_FUSION=1 there. Costs some throughput, no correctness impact.
+   ${NO_GRAD_ACC_FUSION:+--no-gradient-accumulation-fusion}
 )

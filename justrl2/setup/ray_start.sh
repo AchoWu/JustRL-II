@@ -3,8 +3,21 @@ if [ -z "$MASTER_IP" ]; then
     MASTER_IP=$(hostname -I | awk '{print $1}')
 fi
 RAY_PORT=$(($MASTER_PORT + 1))
+# Ray's dashboard agent otherwise binds a fixed 52365, which collides with any other
+# Ray on the host (and with leftovers from an earlier run of this script). When the bind
+# fails the agent stays alive with its HTTP service disabled, and `ray job submit` then
+# fails with a misleading "No available agent to submit job, please try again later".
+RAY_AGENT_PORT=$(($MASTER_PORT + 2))
 export RAY_ADDRESS="${MASTER_IP}:${RAY_PORT}"
 ray stop --force
+# `pkill -9 ray` matches on process name only; the dashboard agent, raylet and gcs_server
+# all run as `python3`/their own binaries, so they survive it and keep holding ports.
+# Match on the full command line instead. Patterns are specific on purpose: a bare
+# `pkill -f ray` would match this very script.
+pkill -9 -f "ray.dashboard" || true
+pkill -9 -f "ray::" || true
+pkill -9 -f raylet || true
+pkill -9 -f gcs_server || true
 pkill -9 ray || true
 pkill -9 redis || true
 
@@ -75,6 +88,7 @@ echo "RAY_SPILL_DIR=${RAY_SPILL_DIR}"
 if [ $RANK -eq 0 ]; then
     ray start --head \
     --port=$RAY_PORT \
+    --dashboard-agent-listen-port=$RAY_AGENT_PORT \
     --temp-dir=$RAY_TMPDIR \
     --num-gpus=${GPUS_PER_NODE} \
     --num-cpus=80 \
@@ -90,6 +104,7 @@ if [ $RANK -eq 0 ]; then
 else
     sleep 10
     ray start --address="$RAY_ADDRESS" \
+    --dashboard-agent-listen-port=$RAY_AGENT_PORT \
     --num-gpus=${GPUS_PER_NODE} \
     --node-ip-address=$(hostname -i) \
     --num-cpus=80 \

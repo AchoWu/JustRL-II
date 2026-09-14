@@ -22,6 +22,33 @@ mkdir -p "$MODELS_DIR"
 
 hf download "$HF_BASE" --local-dir "$MODELS_DIR/$BASE_DIR_NAME"
 
+# The Hub repo ships pytorch_model.bin, but mbridge's SafeTensorIO (used by the
+# converter below) only reads safetensors — it would fail with
+#   ValueError: Weights ['model.embed_tokens.weight'] not found in safetensors files
+# Convert once, in place.
+HF_DIR="$MODELS_DIR/$BASE_DIR_NAME"
+if ! ls "$HF_DIR"/*.safetensors >/dev/null 2>&1; then
+  echo "no safetensors found, converting pytorch_model.bin ..."
+  python - "$HF_DIR" <<'PY'
+import os, sys, torch
+from safetensors.torch import save_file
+
+d = sys.argv[1]
+sd = torch.load(os.path.join(d, "pytorch_model.bin"), map_location="cpu", weights_only=True)
+# safetensors rejects tensors that share storage and requires contiguous buffers.
+out, seen = {}, {}
+for k, v in sd.items():
+    ptr = v.data_ptr()
+    if ptr in seen:
+        v = v.clone()
+    else:
+        seen[ptr] = k
+    out[k] = v.contiguous()
+save_file(out, os.path.join(d, "model.safetensors"), metadata={"format": "pt"})
+print(f"wrote model.safetensors ({len(out)} tensors)")
+PY
+fi
+
 if [ -f "$MODELS_DIR/$BASE_DIR_NAME-torch_dist/latest_checkpointed_iteration.txt" ]; then
   echo "torch_dist checkpoint already exists, skipping conversion"
 else

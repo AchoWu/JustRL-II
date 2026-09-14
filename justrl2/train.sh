@@ -170,7 +170,12 @@ PERF_ARGS=(
   --pipeline-model-parallel-size 1
   --expert-model-parallel-size 1
   --expert-tensor-parallel-size 1
-  --attention-backend flash
+  # flash needs the flash-attn package. On a bare-metal cu12 stack with torch 2.13
+  # no usable flash-attn wheel exists (every wheel for torch 2.2-2.12 references
+  # c10::impl::cow::materialize_cow_storage, removed in 2.13), so set
+  # ATTENTION_BACKEND=fused NVTE_FUSED_ATTN=1 there to use TE's cuDNN
+  # FusedAttention instead. See justrl2/setup/bare_metal_cu129.sh.
+  --attention-backend "${ATTENTION_BACKEND:-flash}"
   --recompute-granularity full          # do not switch to selective at 128k: single 127k samples OOM
   --recompute-method uniform
   --recompute-num-layers 1
@@ -246,8 +251,8 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"${PYTHONPATH}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)\",
-    \"NVTE_FUSED_ATTN\": \"0\",
-    \"NVTE_UNFUSED_ATTN\": \"0\",
+    \"NVTE_FUSED_ATTN\": \"${NVTE_FUSED_ATTN:-0}\",
+    \"NVTE_UNFUSED_ATTN\": \"${NVTE_UNFUSED_ATTN:-0}\",
     \"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN\": \"1\",
     \"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION\": \"10000\",
     \"SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK\": \"1\",
