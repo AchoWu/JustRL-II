@@ -6,7 +6,27 @@ Use the image (`Dockerfile`, built on `radixark/miles:dev`): Megatron-LM, SGLang
 TransformerEngine, Ray and the HF→Megatron converter come preinstalled and the two
 frameworks are symlinked to `Megatron-LM/` and `sglang/` in the repo root, which is what
 `justrl2/train.sh` expects. Mount `models/`, `datasets/` and `runs/` from the host.
-Without the image, see `third_party/README.md`.
+
+Pick the base tag by the **host driver**, since it decides the CUDA runtime:
+
+| tag | CUDA | driver | notes |
+|---|---|---|---|
+| `radixark/miles:dev` | 13.0.3 | ≥ 580 | default; amd64 + arm64 |
+| `radixark/miles:dev-cu12` | 12.9.2 | ≥ 525 | amd64 only |
+
+Both ship the same Megatron-LM (`miles-main`) and `sglang-miles`, and both have flash-attn
+(FA2 + FA3), TransformerEngine 2.17 and apex prebuilt — the recipe and every config are
+identical either way, so `dev-cu12` needs no recipe changes:
+
+```bash
+docker build --build-arg MILES_IMAGE=radixark/miles:dev-cu12 -t justrl2 .
+```
+
+Both tags are rebuilt daily and upstream leaves `MEGATRON_COMMIT` empty (= branch HEAD at
+build time), so pin the dated tag (`dev-cu12-202609130149`, `dev-202609130055`, …) for a run
+you intend to resume — otherwise re-pulling mid-run can land a different Megatron.
+
+Without docker at all, see `third_party/README.md` and `justrl2/setup/bare_metal_cu129.sh`.
 
 Inside the container:
 

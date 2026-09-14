@@ -1,0 +1,8 @@
+# Normalize to LF in the repository. The training stack runs on Linux only, and a
+# CRLF-committed shell script fails there with "bad interpreter: /bin/bash^M".
+# Needed because a Windows checkout may have core.autocrlf=true.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pt binary
+*.safetensors binary

@@ -27,6 +27,35 @@ docker run --gpus all --ipc=host --network=host -it justrl2
 
 Image tags and how they are built: <https://github.com/radixark/miles/tree/main/docker>.
 
+### Choosing the tag: CUDA 13 vs CUDA 12
+
+The tag decides the CUDA runtime, so pick it by the **host driver**:
+
+| tag | CUDA | driver | platforms |
+|---|---|---|---|
+| `radixark/miles:dev` | 13.0.3 | ≥ 580 | amd64, arm64 |
+| `radixark/miles:dev-cu12` | 12.9.2 | ≥ 525 (its `NVIDIA_REQUIRE_CUDA` lists 535/550/560/565/570/580) | amd64 only |
+
+`dev-cu12` is Miles' own `docker/build.py --variant cu12-x86` build, based on
+`lmsysorg/sglang:v0.5.19-cu129` with `ENABLE_CUDA_13=0` and the
+`miles-wheels@cu129-x86_64` release. It carries the same Megatron-LM (`miles-main`) and
+`sglang-miles` as `dev`, and flash-attn (FA2 + FA3), TransformerEngine 2.17 (verified at
+build time by `docker/verify_transformer_engine.py`) and apex are all prebuilt — so the
+recipe, the topology invariants and every config are unchanged:
+
+```bash
+docker build --build-arg MILES_IMAGE=radixark/miles:dev-cu12 -t justrl2 .
+```
+
+One difference that does not affect this recipe: the CUDA 12 variant keeps its base
+image's Mooncake instead of the structured-object-store wheel, so the disaggregated P2P
+weight-transfer path (`--update-weight-transfer-mode` other than `broadcast`) is not
+usable there. Colocate mode does not reach it.
+
+Both tags are rebuilt daily and upstream leaves `MEGATRON_COMMIT` empty (= branch HEAD at
+build time), so pin a dated tag (`dev-cu12-202609130149`, `dev-202609130055`, …) for any
+run you intend to resume.
+
 ## Building on stock NVIDIA Megatron-LM instead
 
 If you cannot use the image, the Miles-specific Megatron changes are collected in

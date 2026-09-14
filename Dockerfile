@@ -15,6 +15,22 @@
 #
 # DSpark speculative decoding is NOT available in this image (it needs an SGLang build
 # that carries the DSpark scheduler); leave DSPARK_DRAFT_MODEL_PATH empty.
+#
+# Which base tag: pick by the *host driver*, since the tag decides the CUDA runtime.
+#
+#   radixark/miles:dev        CUDA 13.0.3  -> needs driver >= 580   (also has arm64)
+#   radixark/miles:dev-cu12   CUDA 12.9.2  -> works on driver >= 525 (amd64 only)
+#
+# Both carry the same Megatron-LM (radixark/Megatron-LM @ miles-main) and sglang-miles,
+# and both have flash-attn (FA2 + FA3), TransformerEngine 2.17 and apex prebuilt, so the
+# recipe and its configs are identical either way. `dev-cu12` is Miles' own
+# `--variant cu12-x86` build on lmsysorg/sglang:v0.5.19-cu129 — it is what to use when
+# the host driver cannot go to 580, and it removes the need for the hand-rolled
+# bare-metal stack in justrl2/setup/bare_metal_cu129.sh.
+#
+# Both `dev` and `dev-cu12` are rebuilt daily and MEGATRON_COMMIT is empty upstream (=
+# branch HEAD at build time), so pin the dated tag for a run you intend to resume:
+#   docker build --build-arg MILES_IMAGE=radixark/miles:dev-cu12-202609130149 -t justrl2 .
 
 ARG MILES_IMAGE=radixark/miles:dev
 FROM ${MILES_IMAGE}

@@ -11,3 +11,7 @@ swanlog/
 *.pt
 *.safetensors
 .DS_Store
+.idea/
+.vscode/
+nohup.out
+miles_args.txt
