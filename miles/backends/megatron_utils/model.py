@@ -170,12 +170,16 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
+    # Megatron renamed --enable-gloo-process-groups to --use-gloo-process-groups;
+    # accept either so the recipe survives both checkouts (see initialize.py).
+    use_gloo_pg = getattr(args, "enable_gloo_process_groups", getattr(args, "use_gloo_process_groups", True))
+
     optimizer = get_megatron_optimizer(
         config=config,
         model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
+        use_gloo_process_groups=use_gloo_pg,
     )
-    
+
     scale_lr_cond = None
     no_wd_decay_cond = None
     lr_mult = 1.0
@@ -193,7 +197,7 @@ def setup_model_and_optimizer(
     if hasattr(args, "use_mup") and args.use_mup:
         optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                         scale_lr_cond, lr_mult,
-                                        use_gloo_process_groups=args.enable_gloo_process_groups)
+                                        use_gloo_process_groups=use_gloo_pg)
     else:
         optimizer = get_megatron_optimizer(config, model)
     

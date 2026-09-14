@@ -196,27 +196,40 @@ def get_model_provider_func(
                     kwargs["vp_stage"] = vp_stage
                 transformer_layer_spec = get_gpt_decoder_block_spec(config, **kwargs)
             else:
-                # Define the decoder layer spec
+                # Megatron's layer-spec signatures drift between releases (e.g.
+                # moe_use_legacy_grouped_gemm and use_true_on_policy_backend were dropped,
+                # and the matching --moe-use-legacy-grouped-gemm flag went with them).
+                # Build the full kwarg set, then keep only what this checkout accepts.
+                def _accepted(fn, **kwargs):
+                    params = inspect.signature(fn).parameters
+                    return {k: v for k, v in kwargs.items() if k in params}
+
                 if use_te:
                     transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        num_experts=args.num_experts,
-                        moe_grouped_gemm=args.moe_grouped_gemm,
-                        qk_layernorm=args.qk_layernorm,
-                        multi_latent_attention=args.multi_latent_attention,
-                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                        **_accepted(
+                            get_gpt_layer_with_transformer_engine_spec,
+                            num_experts=args.num_experts,
+                            moe_grouped_gemm=args.moe_grouped_gemm,
+                            qk_layernorm=args.qk_layernorm,
+                            multi_latent_attention=args.multi_latent_attention,
+                            moe_use_legacy_grouped_gemm=getattr(args, "moe_use_legacy_grouped_gemm", False),
+                        )
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
-                        num_experts=args.num_experts,
-                        moe_grouped_gemm=args.moe_grouped_gemm,
-                        qk_layernorm=args.qk_layernorm,
-                        multi_latent_attention=args.multi_latent_attention,
-                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-                        normalization=args.normalization,
-                        use_kitchen=config.use_kitchen,
-                        use_true_on_policy_backend=config.true_on_policy_contract is not None,
-                        use_kitchen_attention=config.use_kitchen_attention,
-                        kitchen_attention_backend=config.kitchen_attention_backend,
+                        **_accepted(
+                            get_gpt_layer_local_spec,
+                            num_experts=args.num_experts,
+                            moe_grouped_gemm=args.moe_grouped_gemm,
+                            qk_layernorm=args.qk_layernorm,
+                            multi_latent_attention=args.multi_latent_attention,
+                            moe_use_legacy_grouped_gemm=getattr(args, "moe_use_legacy_grouped_gemm", False),
+                            normalization=args.normalization,
+                            use_kitchen=config.use_kitchen,
+                            use_true_on_policy_backend=config.true_on_policy_contract is not None,
+                            use_kitchen_attention=config.use_kitchen_attention,
+                            kitchen_attention_backend=config.kitchen_attention_backend,
+                        )
                     )
 
         build_model_context = nullcontext

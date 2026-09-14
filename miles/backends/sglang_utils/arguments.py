@@ -132,13 +132,27 @@ def add_sglang_arguments(parser):
     return parser
 
 
+def _alias_parallel_size(args, short: str, long: str, default: int = 1) -> None:
+    """Bridge sglang's long-form parallelism flags to the short aliases miles uses.
+
+    These attributes come from ServerArgs.add_cli_args(), so they track whatever the
+    installed sglang declares. Newer builds dropped the long forms
+    (data_parallel_size -> dp_size, ...); older ones only have the long forms. Accept
+    either, and fall back to `default` when neither is present.
+    """
+    long_attr, short_attr = f"sglang_{long}", f"sglang_{short}"
+    if hasattr(args, long_attr):
+        setattr(args, short_attr, getattr(args, long_attr))
+    elif not hasattr(args, short_attr):
+        setattr(args, short_attr, default)
+
+
 def validate_args(args):
     args.sglang_tp_size = args.rollout_num_gpus_per_engine
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
-    if hasattr(args, "sglang_attention_context_parallel_size"):
-        args.sglang_attn_cp_size = args.sglang_attention_context_parallel_size
+    _alias_parallel_size(args, "dp_size", "data_parallel_size")
+    _alias_parallel_size(args, "pp_size", "pipeline_parallel_size")
+    _alias_parallel_size(args, "ep_size", "expert_parallel_size")
+    _alias_parallel_size(args, "attn_cp_size", "attention_context_parallel_size")
 
     if args.true_on_policy_mode:
         args.sglang_enable_deterministic_inference = True
@@ -148,9 +162,9 @@ def validate_args(args):
         args.sglang_enable_deterministic_inference = True
 
     if args.sglang_dp_size > 1:
-        assert args.sglang_enable_dp_attention
+        assert getattr(args, "sglang_enable_dp_attention", False)
 
-    if args.sglang_router_policy:
+    if getattr(args, "sglang_router_policy", None):
         from miles.utils.environ import enable_experimental_rollout_refactor
 
         assert (
