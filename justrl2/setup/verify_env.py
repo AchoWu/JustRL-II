@@ -173,16 +173,26 @@ except Exception as e:
         m = re.search(r"compiled\s+against\s+\((\d+),\s*(\d+),\s*(\d+)\).*?runtime version\s+\((\d+),\s*(\d+),\s*(\d+)\)", msg)
         detail = f"编译期 {'.'.join(m.groups()[:3])} vs 运行时 {'.'.join(m.groups()[3:])}" if m else msg[:90]
         record(FAIL, "cuDNN", f"版本不匹配（{detail}）—— LD_LIBRARY_PATH 里有更老的 cudnn 遮蔽了 torch 自带的")
-        # 把嫌疑路径直接列出来，省得手工找。
+        # 把嫌疑路径列出来，省得手工找。去重：LD_LIBRARY_PATH 里常有重复条目，
+        # 而且不同字符串可能指向同一个真实目录（软链）。
+        seen: set[str] = set()
+        culprits: list[str] = []
         for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
-            if not d:
+            if not d or not Path(d).is_dir():
                 continue
-            hits = sorted(p.name for p in Path(d).glob("libcudnn.so*")) if Path(d).is_dir() else []
+            real = str(Path(d).resolve())
+            if real in seen:
+                continue
+            seen.add(real)
+            hits = sorted(p.name for p in Path(d).glob("libcudnn.so*"))
             if hits:
-                record(FAIL, "  ^ 嫌疑路径", f"{d} 含 {hits}")
+                culprits.append(d)
+                record(WARN, "  ^ 嫌疑路径", f"{d} 含 {hits}")
         cp = os.environ.get("CONDA_PREFIX", "")
-        if cp and (Path(cp, "lib") / "libcudnn.so").exists():
-            record(FAIL, "  ^ conda cudnn", f"{cp}/lib 里有 libcudnn —— 见下方修复建议")
+        if cp and list(Path(cp, "lib").glob("libcudnn.so*")):
+            culprits.append(str(Path(cp, "lib")))
+            record(WARN, "  ^ conda cudnn", f"{cp}/lib 里有 libcudnn")
+        globals()["_cudnn_culprits"] = culprits
     else:
         record(FAIL, "cuDNN", f"查询失败: {msg[:110]}")
 
@@ -280,22 +290,32 @@ if repo is None:
     record(FAIL, "仓库根目录", "找不到（需同时看到 requirements.txt 和 justrl2/）")
 else:
     record(PASS, "仓库根目录", str(repo))
+    # 标签带 "目录" 后缀，避免和下面的 import 检查同名 —— 修复建议是按标签匹配的，
+    # 同名会让「框架目录缺失」在其实只是缺一个纯 Python 依赖时误触发。
     for d in ("Megatron-LM", "sglang"):
         p = repo / d
         if p.exists():
-            record(PASS, d, f"{p} -> {os.readlink(p) if p.is_symlink() else '(实体目录)'}")
+            record(PASS, f"{d} 目录", f"{p} -> {os.readlink(p) if p.is_symlink() else '(实体目录)'}")
         else:
-            record(FAIL, d, f"{p} 不存在 —— train.sh 会直接 exit 1")
+            record(FAIL, f"{d} 目录", f"{p} 不存在 —— train.sh 会直接 exit 1")
 
     # train.sh 设 PYTHONPATH=.:Megatron-LM:sglang/python，这里手动补上以便 import 检查。
     for extra in (repo, repo / "Megatron-LM", repo / "sglang" / "python"):
         if extra.exists() and str(extra) not in sys.path:
             sys.path.insert(0, str(extra))
 
-    for mod, label in (("megatron.core", "megatron"), ("sglang", "sglang"), ("miles", "miles")):
+    for mod, label in (("megatron.core", "megatron"), ("sglang", "sglang import"), ("miles", "miles")):
         try:
             m = __import__(mod, fromlist=["__file__"])
             record(PASS, label, getattr(m, "__version__", "") or (getattr(m, "__file__", "") or "")[:70])
+        except ModuleNotFoundError as e:
+            # 缺一个纯 Python 依赖（sglang/miles 的依赖被 --no-deps 跳过了）和框架本身
+            # 装坏了是两回事，前者 check_deps.py 一条命令就能补齐。
+            missing = getattr(e, "name", "") or ""
+            if missing and missing.split(".")[0] not in (mod.split(".")[0], "megatron", "sglang", "miles"):
+                record(WARN, label, f"缺依赖 '{missing}' —— 跑 check_deps.py --pip 补齐（框架本身在位）")
+            else:
+                record(FAIL, label, f"ModuleNotFoundError: {str(e)[:110]}")
         except Exception as e:
             record(FAIL, label, f"{type(e).__name__}: {str(e)[:110]}")
 
@@ -363,16 +383,45 @@ if n_fail:
     fixes: list[str] = []
 
     if "cuDNN" in failed:
-        fixes.append(
-            "cuDNN 版本不匹配：conda 的 cudnn 遮蔽了 torch 自带的。\n"
-            "  bare_metal_cu129.sh 第 4 节 `conda install cudnn` 只是为了拿 cudnn.h 编 TE，\n"
-            "  头文件留着即可，但它的 .so 必须从动态库搜索路径里挪走：\n"
-            "    mkdir -p $CONDA_PREFIX/lib/_shadowed\n"
-            "    mv $CONDA_PREFIX/lib/libcudnn*.so* $CONDA_PREFIX/lib/_shadowed/\n"
-            "  然后重开 shell 验证：python -c \"import torch;print(torch.backends.cudnn.version())\""
-        )
+        culprits = globals().get("_cudnn_culprits", [])
+        conda_lib = str(Path(os.environ.get("CONDA_PREFIX", "/nonexistent"), "lib"))
+        sys_dirs = [d for d in culprits if d != conda_lib]
+        lines = [
+            "cuDNN 版本不匹配：搜索路径里有更老的 libcudnn 抢先被 dlopen，遮蔽了 torch 自带的。",
+            "  cuDNN 是本栈实际使用的 attention 路径（没装 flash-attn，TE 走 cuDNN FusedAttention），",
+            "  所以这条必须修。",
+        ]
+        if sys_dirs:
+            lines += [
+                "",
+                f"  元凶是系统 CUDA 目录（不是 conda）：{', '.join(sys_dirs)}",
+                "  这些目录属于系统，不要动里面的文件 —— 只需把它们从 LD_LIBRARY_PATH 里去掉。",
+                "  torch 自带 cudnn 在 site-packages/nvidia/cudnn/lib，不需要系统的。",
+                "",
+                "    # 当前 shell 先验证：",
+                "    export LD_LIBRARY_PATH=$(python - <<'PY'",
+                "import os",
+                "bad = " + repr(sys_dirs),
+                "keep = [d for d in os.environ.get('LD_LIBRARY_PATH','').split(':')",
+                "        if d and not any(os.path.realpath(d) == os.path.realpath(b) for b in bad)]",
+                "print(':'.join(keep))",
+                "PY",
+                "    )",
+                '    python -c "import torch; print(torch.backends.cudnn.version())"   # 期望 92000',
+                "",
+                "  确认好了再固化到环境里（脚本第 2 节的同一个文件）：",
+                "    $CONDA_PREFIX/etc/conda/activate.d/cuda129.sh",
+            ]
+        if conda_lib in culprits:
+            lines += [
+                "",
+                "  conda 的 cudnn（脚本第 4 节为编 TE 装的，头文件已用完）可以直接挪走：",
+                "    mkdir -p $CONDA_PREFIX/lib/_shadowed",
+                "    mv $CONDA_PREFIX/lib/libcudnn*.so* $CONDA_PREFIX/lib/_shadowed/",
+            ]
+        fixes.append("\n".join(lines))
 
-    if "Megatron-LM" in failed or "sglang" in failed:
+    if "Megatron-LM 目录" in failed or "sglang 目录" in failed:
         fixes.append(
             "框架目录缺失（train.sh 会直接 exit 1）。必须在仓库根目录执行：\n"
             "    git clone --depth 1 -b miles-main https://github.com/radixark/Megatron-LM.git _Megatron-LM \\\n"
