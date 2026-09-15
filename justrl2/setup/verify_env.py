@@ -129,16 +129,25 @@ else:
 
 # transformer_engine_torch 是 ABI 断裂的重灾区：预编译 wheel 针对 torch <= 2.12，
 # 在 2.13 上 import 报 undefined symbol: ..._ZN3c104impl3cow23materialize_cow_storage...
-try:
-    import transformer_engine_torch  # noqa: F401
+# 注意 TE 2.17 起顶层 transformer_engine 会把它 re-export 成
+# transformer_engine.transformer_engine_torch，顶层模块名可能不存在 —— 两处都试。
+_tet = None
+for _name in ("transformer_engine_torch", "transformer_engine.transformer_engine_torch"):
+    try:
+        __import__(_name)
+        _tet = _name
+        break
+    except ImportError as e:
+        _tet_err = str(e)
 
-    record(PASS, "transformer_engine_torch", f"import OK ({_ver('transformer-engine-torch')})")
-except ImportError as e:
-    msg = str(e)
-    if "materialize_cow" in msg:
-        record(FAIL, "transformer_engine_torch", "ABI 断裂（materialize_cow_storage）—— 需按脚本第 4 节源码重编")
-    else:
-        record(FAIL, "transformer_engine_torch", f"import 失败: {msg[:120]}")
+if _tet:
+    record(PASS, "transformer_engine_torch", f"import OK as {_tet} ({_ver('transformer-engine-torch')})")
+elif "materialize_cow" in _tet_err:
+    record(FAIL, "transformer_engine_torch", "ABI 断裂（materialize_cow_storage）—— 需按脚本第 4 节源码重编")
+elif _ver("transformer-engine-torch"):
+    record(WARN, "transformer_engine_torch", f"包已装({_ver('transformer-engine-torch')})但顶层模块不可 import；TE 自己能用即可")
+else:
+    record(FAIL, "transformer_engine_torch", f"未装 —— {_tet_err[:100]}")
 
 try:
     import transformer_engine.pytorch as te_pt  # noqa: F401
@@ -148,6 +157,10 @@ except Exception as e:  # 不只是 ImportError：缺 onnxscript 会抛别的
     record(FAIL, "transformer_engine.pytorch", f"{type(e).__name__}: {str(e)[:120]}")
 
 # cuDNN 是 TE fused attention 的后端，也就是本栈实际使用的 attention 路径。
+# torch.backends.cudnn.version() 在运行时版本与编译期不匹配时**抛异常**而不是返回值，
+# 报错文本里含 "cuDNN version incompatibility"。成因几乎总是 LD_LIBRARY_PATH 里有
+# 一个更老的 cudnn（常见来源：conda install cudnn 装到 $CONDA_PREFIX/lib）抢先被
+# dlopen，遮蔽了 torch 自带的那个。
 try:
     v = torch.backends.cudnn.version()
     if v and v >= 90000:
@@ -155,7 +168,23 @@ try:
     else:
         record(FAIL, "cuDNN", f"{v} —— 异常，TE 的 FusedAttention 需要 cuDNN 9+")
 except Exception as e:
-    record(FAIL, "cuDNN", f"查询失败: {e}")
+    msg = str(e).replace("\n", " ")
+    if "incompatibility" in msg:
+        m = re.search(r"compiled\s+against\s+\((\d+),\s*(\d+),\s*(\d+)\).*?runtime version\s+\((\d+),\s*(\d+),\s*(\d+)\)", msg)
+        detail = f"编译期 {'.'.join(m.groups()[:3])} vs 运行时 {'.'.join(m.groups()[3:])}" if m else msg[:90]
+        record(FAIL, "cuDNN", f"版本不匹配（{detail}）—— LD_LIBRARY_PATH 里有更老的 cudnn 遮蔽了 torch 自带的")
+        # 把嫌疑路径直接列出来，省得手工找。
+        for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+            if not d:
+                continue
+            hits = sorted(p.name for p in Path(d).glob("libcudnn.so*")) if Path(d).is_dir() else []
+            if hits:
+                record(FAIL, "  ^ 嫌疑路径", f"{d} 含 {hits}")
+        cp = os.environ.get("CONDA_PREFIX", "")
+        if cp and (Path(cp, "lib") / "libcudnn.so").exists():
+            record(FAIL, "  ^ conda cudnn", f"{cp}/lib 里有 libcudnn —— 见下方修复建议")
+    else:
+        record(FAIL, "cuDNN", f"查询失败: {msg[:110]}")
 
 # ---------------------------------------------------------------------------
 section("5) cu13 包污染 —— cu12/cu13 共用安装路径，后装的覆盖前者 .so")
@@ -176,9 +205,13 @@ else:
 try:
     import nvidia.nccl
 
-    so = Path(nvidia.nccl.__file__).parent / "lib" / "libnccl.so.2"
-    if so.exists():
-        blob = so.read_bytes()
+    # nvidia.* 是 namespace package，__file__ 可能是 None；用 __path__ 找目录。
+    roots = [Path(p) for p in getattr(nvidia.nccl, "__path__", [])]
+    if nvidia.nccl.__file__:
+        roots.insert(0, Path(nvidia.nccl.__file__).parent)
+    sos = [so for root in roots for so in [root / "lib" / "libnccl.so.2"] if so.exists()]
+    if sos:
+        blob = sos[0].read_bytes()
         vers = sorted(set(re.findall(rb"2\.\d\d\.\d", blob)))
         real = b", ".join(vers).decode() if vers else "?"
         hdr = ".".join(str(x) for x in torch.cuda.nccl.version())
@@ -187,7 +220,7 @@ try:
         else:
             record(PASS, "libnccl.so.2", f"文件 {real} (torch 报头文件版本 {hdr})")
     else:
-        record(WARN, "libnccl.so.2", f"没找到 {so}")
+        record(WARN, "libnccl.so.2", f"在 {[str(r) for r in roots]} 下没找到")
 except ImportError:
     record(WARN, "nvidia.nccl", "查不到 —— torch 可能链接的是系统 NCCL")
 
@@ -325,7 +358,57 @@ if n_fail:
     for lvl, name, detail in results:
         if lvl == FAIL:
             print(f"  - {name}: {detail}")
-    print("\n先修掉这些，再跑 python justrl2/setup/check_deps.py --pip 补纯 Python 依赖。")
+
+    failed = {name for lvl, name, _ in results if lvl == FAIL}
+    fixes: list[str] = []
+
+    if "cuDNN" in failed:
+        fixes.append(
+            "cuDNN 版本不匹配：conda 的 cudnn 遮蔽了 torch 自带的。\n"
+            "  bare_metal_cu129.sh 第 4 节 `conda install cudnn` 只是为了拿 cudnn.h 编 TE，\n"
+            "  头文件留着即可，但它的 .so 必须从动态库搜索路径里挪走：\n"
+            "    mkdir -p $CONDA_PREFIX/lib/_shadowed\n"
+            "    mv $CONDA_PREFIX/lib/libcudnn*.so* $CONDA_PREFIX/lib/_shadowed/\n"
+            "  然后重开 shell 验证：python -c \"import torch;print(torch.backends.cudnn.version())\""
+        )
+
+    if "Megatron-LM" in failed or "sglang" in failed:
+        fixes.append(
+            "框架目录缺失（train.sh 会直接 exit 1）。必须在仓库根目录执行：\n"
+            "    git clone --depth 1 -b miles-main https://github.com/radixark/Megatron-LM.git _Megatron-LM \\\n"
+            "      && ln -sfn _Megatron-LM Megatron-LM\n"
+            "    git clone --depth 1 -b sglang-miles https://github.com/sgl-project/sglang.git _sglang \\\n"
+            "      && ln -sfn _sglang sglang"
+        )
+
+    if "cu13 包" in failed or "libnccl.so.2" in failed:
+        fixes.append(
+            "cu13 包污染（cu12/cu13 共用 site-packages/nvidia/<lib>/lib/，后装的覆盖 .so）：\n"
+            "    pip uninstall -y $(pip list 2>/dev/null | awk '/^nvidia-.*-cu13/{print $1}')\n"
+            "    pip install --force-reinstall --no-deps 'nvidia-nccl-cu12==2.29.7' \\\n"
+            "        nvidia-cudnn-cu12 nvidia-cusparselt-cu12 nvidia-nvshmem-cu12\n"
+            "  （--force-reinstall 是必需的：卸载删掉了共用路径下的 .so，pip 认为 cu12 已装不会重写）"
+        )
+
+    if "flash-attn" in failed:
+        fixes.append("pip uninstall -y flash-attn   # 装着它 TE 就会去 import 然后崩")
+
+    if "numpy" in failed:
+        fixes.append("pip install 'numpy<2'   # Megatron 硬断言 1.x")
+
+    if "nvcc" in failed:
+        fixes.append(
+            "nvcc 不是 12.9（JIT 会报 Unknown option '--compress-mode=size'）：\n"
+            "    conda deactivate && conda activate " + (os.environ.get("CONDA_DEFAULT_ENV") or "justrl2") + "\n"
+            "  activate.d/cuda129.sh 会设 CUDA_HOME/PATH；不生效就检查那个文件是否存在。"
+        )
+
+    if fixes:
+        print("\n--- 修复建议 ---")
+        for i, f in enumerate(fixes, 1):
+            print(f"\n{i}. {f}")
+
+    print("\n修完再跑一遍本脚本，然后 python justrl2/setup/check_deps.py --pip 补纯 Python 依赖。")
     sys.exit(1)
 
 print("\n没有 FAIL。下一步：")
