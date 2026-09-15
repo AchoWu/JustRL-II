@@ -269,14 +269,38 @@ if [ -n "$CU13_PKGS" ]; then
   # 卸载会删掉共用路径下的 .so，所以必须 force-reinstall 把 cu12 版本写回去
   # （pip 认为 cu12 已装，不加 --force-reinstall 不会重写文件）
   pip install --force-reinstall --no-deps \
-      "nvidia-nccl-cu12==2.29.7" nvidia-cudnn-cu12 nvidia-cusparselt-cu12 nvidia-nvshmem-cu12
+      "nvidia-nccl-cu12==2.29.7" "nvidia-cudnn-cu12==9.22.0.52" nvidia-cusparselt-cu12 nvidia-nvshmem-cu12
 fi
+
+# cudnn 版本必须 pin。这台机器上不 pin 会装到 9.20.0.48，然后
+# torch.backends.cudnn.version() 抛
+#   cuDNN version incompatibility: PyTorch was compiled against (9, 20, 0)
+#   but found runtime version (9, 14, 0)   ← 或 (9, 5, 1)，取决于系统装了哪个
+# 注意报错里的"运行时版本"不是这个包的版本：libcudnn.so.9 只有 ~130KB，是个
+# dispatch shim，真正的实现在 libcudnn_graph / _ops / _cnn / _engines_*.so.9 里，
+# 按 SONAME 在运行时解析。而系统的 /etc/ld.so.conf.d/ 往往把这些子库注册进
+# ldconfig 缓存（本机指向 /usr/local/cuda-12.4/targets/x86_64-linux/lib 的 9.5.1），
+# 其优先级独立于 LD_LIBRARY_PATH —— 所以"把 cuda-12.4 从 LD_LIBRARY_PATH 去掉"
+# 并不能解决，实测清空后仍然复现。
+# 9.22.0.52 是 Miles 官方 Dockerfile 的 cu12 分支所 pin 的版本，装上后 torch 报 92200。
+pip install --force-reinstall --no-deps "nvidia-cudnn-cu12==9.22.0.52"
+
+# torch 自带 cudnn 必须排在系统 cudnn 之前 —— 见上一段关于 ldconfig 缓存的说明。
+# 固化进 activate.d，否则新开 shell 又会走回系统那份子库。
+CUDNN_LIB=$(python -c "import nvidia.cudnn, os; print(os.path.join(list(nvidia.cudnn.__path__)[0], 'lib'))")
+cat >> "$CONDA_PREFIX/etc/conda/activate.d/cuda129.sh" <<EOF
+# torch 自带的 cudnn 必须优先于系统 ldconfig 缓存里的（/usr/local/cuda-12.4 那份是
+# 9.5.1），否则 libcudnn.so.9 这个 shim 会去加载系统的子库，torch 报
+# "cuDNN version incompatibility"。cuDNN 是本栈实际的 attention 后端。
+export LD_LIBRARY_PATH="${CUDNN_LIB}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+EOF
+export LD_LIBRARY_PATH="${CUDNN_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 python -c "
 import torch
 v = torch.backends.cudnn.version()
 print('cudnn', v, '| nccl', torch.cuda.nccl.version())
-assert v and v >= 90000, f'cudnn {v} 异常'
+assert v and v >= 92000, f'cudnn {v} 异常 —— 期望 >= 92000，见上方 ldconfig 说明'
 "
 
 # ---------------------------------------------------------------------------
