@@ -32,6 +32,18 @@ export SAVE_INTERVAL=1000               # 冒烟不存 ckpt
 export HF_SAVE_INTERVAL=0
 export EVAL_INTERVAL=1000               # 不做训练中 eval
 
+# LR warmup 必须跟着缩。Megatron 的 OptimizerParamScheduler 断言
+#   lr_warmup_steps < lr_decay_steps
+# 而两者都是按 GBS 换算的（miles/backends/megatron_utils/model.py）：
+#   train_iters      = NUM_ROLLOUT * ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / GBS
+#   lr_decay_steps   = train_iters * GBS
+#   lr_warmup_steps  = CRITIC_LR_WARMUP_ITERS * GBS      （critic 也走这个函数）
+# 配方默认 NUM_ROLLOUT=500 / CRITIC_LR_WARMUP_ITERS=10 是 10 < 500，没问题；
+# 冒烟把 NUM_ROLLOUT 降到 3 后 train_iters=3，10 > 3 就直接 AssertionError
+# —— 在 MegatronTrainRayActor.init() 里抛，8 个 SGLang engine 已经起完、
+# Triton kernel 也编译完了才炸，白等二十多分钟，所以这里必须一起改。
+export CRITIC_LR_WARMUP_ITERS=1
+
 CONFIG=${CONFIG:-justrl2/configs/1node-8gpu-32k-baremetal.env}
 LOG=${LOG:-/tmp/smoke_$(date +%m%d_%H%M%S).log}
 

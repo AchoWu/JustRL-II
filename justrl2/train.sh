@@ -56,6 +56,23 @@ ACTOR_DP=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE / TENSOR_MODEL_PARALLEL_SI
 [ $((GLOBAL_BATCH_SIZE % ACTOR_DP)) -eq 0 ] \
   || { echo "FATAL: GBS=$GLOBAL_BATCH_SIZE not divisible by actor DP=$ACTOR_DP; adjust ROLLOUT_BATCH_SIZE" >&2; exit 1; }
 
+# Megatron's OptimizerParamScheduler asserts lr_warmup_steps < lr_decay_steps. Both are
+# scaled by GBS (miles/backends/megatron_utils/model.py::get_optimizer_param_scheduler):
+#   TRAIN_ITERS     = NUM_ROLLOUT * ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / GBS
+#   lr_decay_steps  = TRAIN_ITERS * GBS
+#   lr_warmup_steps = CRITIC_LR_WARMUP_ITERS * GBS     (the critic shares this scheduler)
+# so it reduces to CRITIC_LR_WARMUP_ITERS < TRAIN_ITERS. Check it here: the assert
+# otherwise fires inside MegatronTrainRayActor.init(), i.e. after every SGLang engine has
+# started and compiled its Triton kernels — twenty-plus minutes in.
+TRAIN_ITERS=$((NUM_ROLLOUT * ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / GLOBAL_BATCH_SIZE))
+[ "$CRITIC_LR_WARMUP_ITERS" -lt "$TRAIN_ITERS" ] \
+  || { echo "FATAL: CRITIC_LR_WARMUP_ITERS=$CRITIC_LR_WARMUP_ITERS must be < TRAIN_ITERS=$TRAIN_ITERS" \
+            "(= NUM_ROLLOUT=$NUM_ROLLOUT * RBS=$ROLLOUT_BATCH_SIZE * N=$N_SAMPLES_PER_PROMPT / GBS=$GLOBAL_BATCH_SIZE)." \
+            "Lower CRITIC_LR_WARMUP_ITERS or raise NUM_ROLLOUT." >&2; exit 1; }
+[ "$NUM_CRITIC_ONLY_STEPS" -lt "$NUM_ROLLOUT" ] \
+  || { echo "FATAL: NUM_CRITIC_ONLY_STEPS=$NUM_CRITIC_ONLY_STEPS >= NUM_ROLLOUT=$NUM_ROLLOUT:" \
+            "the policy would never be updated." >&2; exit 1; }
+
 # ---- checkpoints ----------------------------------------------------------------
 SAVE_DIR=${SAVE_DIR:-${SAVE_ROOT}/${EXP_TAG}}
 CRITIC_SAVE_DIR=${CRITIC_SAVE_DIR:-${SAVE_DIR%/}_critic}
