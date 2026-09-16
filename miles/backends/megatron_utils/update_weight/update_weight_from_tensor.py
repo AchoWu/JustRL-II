@@ -179,6 +179,12 @@ class UpdateWeightFromTensor:
             mode = self.args.pause_generation_mode
             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            # Newer sglang requires an open weight-update session around every
+            # update_weights_from_* call; older builds have no such endpoint and the
+            # engine helper returns None. One session per update_weights() — it spans
+            # all buckets — covering the distributed engines too, since _send_base_params
+            # feeds them through update_weights_from_distributed in the same pass.
+            ray.get([engine.begin_weight_update.remote() for engine in self._session_engines()])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     rollout_engines=self.rollout_engines,
@@ -223,6 +229,11 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         if rank == 0:
+            # Close the sessions opened above before the post-load hooks:
+            # end_weight_update is what re-finalizes quantized weights, and sglang's
+            # release/resume paths assert that no session is still open.
+            ray.get([engine.end_weight_update.remote() for engine in self._session_engines()])
+
             # `post_process_quantization` is related to the `process_weights_after_loading`
             # in the sglang rollout side, which should always be invoked after weight
             # updating.
@@ -233,6 +244,17 @@ class UpdateWeightFromTensor:
             )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _session_engines(self) -> list:
+        """Every engine that receives weights this round, colocated and distributed.
+
+        connect_rollout_engines only sets distributed_rollout_engines when
+        use_distribute, so read it defensively.
+        """
+        engines = list(self.rollout_engines)
+        if getattr(self, "use_distribute", False):
+            engines += list(getattr(self, "distributed_rollout_engines", []))
+        return engines
 
     def _send_base_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         refs, long_lived_tensors = _send_to_colocated_engine(

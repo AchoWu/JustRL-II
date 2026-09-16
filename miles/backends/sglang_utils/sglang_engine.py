@@ -258,6 +258,51 @@ class SGLangEngine(RayActor):
             raise
         return response.json()
 
+    def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
+        """Open a weight-update session, required by newer sglang builds.
+
+        sglang's WeightUpdater gained a session protocol: update_weights_from_tensor
+        and update_weights_from_distributed now assert `_weight_update_in_progress`
+        and abort the scheduler with
+
+            AssertionError: update_weights_from_tensor requires an open
+            begin_weight_update session
+
+        The session unpacks in-place-quantized weights so fresh ones can be loaded,
+        and end_weight_update re-finalizes them. Both request bodies default every
+        field, so an empty payload is the correct "plain base-weight sync".
+
+        Returns None on builds without the endpoint, so callers can no-op.
+        """
+        return self._make_optional_request("begin_weight_update", {"selector": selector, "sync_base": sync_base})
+
+    def end_weight_update(self, abort: bool = False):
+        """Close the session opened by begin_weight_update. See there."""
+        return self._make_optional_request("end_weight_update", {"abort": abort})
+
+    def _make_optional_request(self, endpoint: str, payload: dict | None = None):
+        """POST to an endpoint that older sglang builds may not expose.
+
+        Returns None when the build predates the endpoint (FastAPI answers 404),
+        so a caller can treat "no session protocol" and "session opened" alike.
+        Any other error still raises — a 404 is a version difference, but a 400
+        from begin_weight_update means a session was already open, which is a bug
+        worth surfacing.
+        """
+        if self.node_rank != 0:
+            return None
+
+        url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
+        response = requests.post(url, json=payload or {})
+        if response.status_code == 404:
+            return None
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            e.add_note(f"{response.text=}")
+            raise
+        return response.json()
+
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
 

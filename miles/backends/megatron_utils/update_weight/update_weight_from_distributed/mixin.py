@@ -142,6 +142,12 @@ class DistBucketedWeightUpdateMixin:
             if mode not in ("in_place"):
                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
+            # Newer sglang requires an open weight-update session around every
+            # update_weights_from_* call; older builds have no such endpoint and the
+            # engine helper returns None. Opened once per update_weights() because the
+            # session spans all buckets, and closed in _finalize_and_resume_engines.
+            ray.get([engine.begin_weight_update.remote() for engine in self.rollout_engines])
+
             # int4/fp4 pre_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -153,6 +159,11 @@ class DistBucketedWeightUpdateMixin:
     def _finalize_and_resume_engines(self, post_load_weights: bool = False) -> None:
         """Run post-process if needed and resume rollout engines."""
         if dist.get_rank() == 0:
+            # Close the session opened in _pause_and_prepare_engines before the
+            # post-load hooks: end_weight_update is what re-finalizes quantized
+            # weights, and sglang's own release/resume paths assert no session is open.
+            ray.get([engine.end_weight_update.remote() for engine in self.rollout_engines])
+
             # post_process_quantization is related to the process_weights_after_loading
             # in the sglang rollout side, which should always be invoked after weight
             # updating.
