@@ -263,8 +263,19 @@ if [ "$USE_SWANLAB" = 1 ]; then
 fi
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -c 'NV[0-9]' || true); NVLINK_COUNT=${NVLINK_COUNT:-0}
+# LD_LIBRARY_PATH is forwarded explicitly because the training actors run as Ray
+# workers, which inherit whatever the raylet was started with rather than the shell
+# that launched this script. It matters on stacks where the loader order decides which
+# cuDNN sub-libraries get picked: libcudnn.so.9 is a ~130KB dispatch shim and the real
+# implementations (libcudnn_graph/_ops/_cnn/_engines_*.so.9) are resolved by SONAME at
+# runtime, so a system ldconfig entry for an older cuDNN wins unless torch's bundled
+# directory comes first — TE's FusedAttention then dies mid-forward with
+#   cuDNN Error: ... CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+LD_LIBRARY_PATH_ENV=""
+[ -n "${LD_LIBRARY_PATH:-}" ] && LD_LIBRARY_PATH_ENV="\"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH}\","
 RUNTIME_ENV_JSON="{
   \"env_vars\": {${DSPARK_ENV}
+    ${LD_LIBRARY_PATH_ENV}
     \"PYTHONPATH\": \"${PYTHONPATH}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)\",
