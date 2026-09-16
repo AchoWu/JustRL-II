@@ -285,21 +285,69 @@ fi
 # 9.22.0.52 是 Miles 官方 Dockerfile 的 cu12 分支所 pin 的版本，装上后 torch 报 92200。
 pip install --force-reinstall --no-deps "nvidia-cudnn-cu12==9.22.0.52"
 
-# torch 自带 cudnn 必须排在系统 cudnn 之前 —— 见上一段关于 ldconfig 缓存的说明。
-# 固化进 activate.d，否则新开 shell 又会走回系统那份子库。
+# 把系统 cudnn 从 ldconfig 缓存里摘掉 —— 这一步是必需的，不是优化。
+#
+# Miles 官方 Dockerfile 在同一处踩过并记录了成因（docker/Dockerfile 第 175 行附近）：
+#   "The apt copy shadows the pip one in ldconfig and the loader interleaves the two,
+#    so transformer_engine gets a mixed set of libcudnn sub-libraries."
+# 它的解法是 apt-get remove --purge libcudnn9-cuda-12，也就是把系统那份删掉。
+#
+# 关键点：LD_LIBRARY_PATH 压不住它。ldconfig 缓存是**独立的解析路径**，加载器会把
+# 两边交错取用，于是 libcudnn.so.9（9.22 的 shim）配上系统的 9.5.1 子库，TE 的
+# FusedAttention 在 critic 第一次前向就报
+#   cuDNN Error: CUDNN_BACKEND_TENSOR_DESCRIPTOR cudnnFinalize failed
+#   cudnn_status: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+# 实测：把 torch 自带 cudnn 目录前置到 LD_LIBRARY_PATH 并确认已传进 Ray worker，
+# 报错一字不变；只有摘掉缓存条目才生效。
+#
+# 本机的系统 cudnn 来自 CUDA toolkit 而非独立 apt 包（/usr/local/cuda-12.4/targets/
+# x86_64-linux/lib），所以注释掉注册它的 ld.so.conf.d 条目，而不是 apt remove。
+# 这会让同目录的 cublas/cufft 等也退出缓存 —— 本栈安全：CUDA_HOME 指向 conda 的
+# 12.9，torch/TE 用的是各自 pip 包里的库，靠 rpath 解析。pip 的 cudnn 本来就不进
+# ldconfig 缓存（靠 rpath + LD_LIBRARY_PATH），所以缓存里为空才是正确状态。
+for conf in /etc/ld.so.conf.d/*.conf; do
+  [ -f "$conf" ] || continue
+  # 只处理确实注册了 libcudnn 的目录，别误伤其他 conf（cublas/cufft 等照旧）
+  has_cudnn=0
+  while read -r d; do
+    [ -n "$d" ] || continue
+    case "$d" in \#*) continue ;; esac
+    if [ -d "$d" ] && ls "$d"/libcudnn*.so* >/dev/null 2>&1; then has_cudnn=1; break; fi
+  done < "$conf"
+  [ "$has_cudnn" = 1 ] || continue
+  echo "[setup] 从 ldconfig 摘掉系统 cudnn: $conf"
+  cp -n "$conf" "$conf.justrl2.bak" 2>/dev/null || true
+  sed -i 's|^\([^#].*\)$|#\1  # JustRL2: shadows pip cudnn, TE mixes sub-libraries|' "$conf"
+done
+ldconfig
+if ldconfig -p | grep -q libcudnn; then
+  echo "WARN: ldconfig 缓存里仍有 libcudnn，TE 可能混载子库："
+  ldconfig -p | grep libcudnn | head -3
+fi
+
+# torch 自带 cudnn 目录仍然前置（缓存清空后由它提供子库）。
+# 幂等：反复 activate 不重复叠加。
 CUDNN_LIB=$(python -c "import nvidia.cudnn, os; print(os.path.join(list(nvidia.cudnn.__path__)[0], 'lib'))")
-cat >> "$CONDA_PREFIX/etc/conda/activate.d/cuda129.sh" <<EOF
-# torch 自带的 cudnn 必须优先于系统 ldconfig 缓存里的（/usr/local/cuda-12.4 那份是
-# 9.5.1），否则 libcudnn.so.9 这个 shim 会去加载系统的子库，torch 报
-# "cuDNN version incompatibility"。cuDNN 是本栈实际的 attention 后端。
-export LD_LIBRARY_PATH="${CUDNN_LIB}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+cat >> "$CONDA_PREFIX/etc/conda/activate.d/cuda129.sh" <<'EOF'
+# torch 自带的 cudnn 子库目录。pip 的 cudnn 不进 ldconfig 缓存，需要显式在路径里。
+# 另见上方把系统 cudnn 从 ldconfig 摘掉的那一步 —— 两者都要，缺一不可。
+CUDNN_LIB="$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cudnn/lib"
+case ":$LD_LIBRARY_PATH:" in
+  *":$CUDNN_LIB:"*) ;;
+  *) export LD_LIBRARY_PATH="$CUDNN_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+esac
 EOF
-export LD_LIBRARY_PATH="${CUDNN_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+case ":${LD_LIBRARY_PATH:-}:" in
+  *":$CUDNN_LIB:"*) ;;
+  *) export LD_LIBRARY_PATH="${CUDNN_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+esac
 
 python -c "
-import torch
+import ctypes, torch
+# shim 的版本号对不代表能用：实现都在子库里，按 SONAME 运行时解析。
+ctypes.CDLL('libcudnn_graph.so.9')
 v = torch.backends.cudnn.version()
-print('cudnn', v, '| nccl', torch.cuda.nccl.version())
+print('cudnn', v, '(子库可加载) | nccl', torch.cuda.nccl.version())
 assert v and v >= 92000, f'cudnn {v} 异常 —— 期望 >= 92000，见上方 ldconfig 说明'
 "
 

@@ -12,6 +12,7 @@ init_process_group、甚至 save_checkpoint 时），所以在这里拦住是值
 
 from __future__ import annotations
 
+import ctypes
 import importlib.metadata as md
 import os
 import re
@@ -181,42 +182,43 @@ except Exception as e:
         m = re.search(r"compiled\s+against\s+\((\d+),\s*(\d+),\s*(\d+)\).*?runtime version\s+\((\d+),\s*(\d+),\s*(\d+)\)", msg)
         detail = f"编译期 {'.'.join(m.groups()[:3])} vs 运行时 {'.'.join(m.groups()[3:])}" if m else msg[:90]
         record(FAIL, "cuDNN", f"版本不匹配（{detail}）")
-
-        pkg_ver = _ver("nvidia-cudnn-cu12")
-        record(WARN, "  ^ nvidia-cudnn-cu12", f"{pkg_ver or '未装'}（建议 9.22.0.52）")
-
-        # torch 自带的 cudnn 目录是否已在 LD_LIBRARY_PATH 里（成因 b 的判据）
-        try:
-            import nvidia.cudnn
-
-            bundled = Path(list(nvidia.cudnn.__path__)[0], "lib")
-            ldp = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if d]
-            on_path = any(Path(d).resolve() == bundled.resolve() for d in ldp if Path(d).is_dir())
-            record(
-                WARN,
-                "  ^ torch 自带 cudnn",
-                f"{bundled} {'已在 LD_LIBRARY_PATH' if on_path else '不在 LD_LIBRARY_PATH（成因 b）'}",
-            )
-            globals()["_cudnn_bundled"] = str(bundled)
-            globals()["_cudnn_on_path"] = on_path
-        except ImportError:
-            record(WARN, "  ^ torch 自带 cudnn", "找不到 nvidia.cudnn 包")
-
-        # ldconfig 缓存把 cudnn 子库指到哪 —— 这是 LD_LIBRARY_PATH 之外的第二条路
-        try:
-            out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=20).stdout
-            sysdirs = {
-                str(Path(line.split("=>")[-1].strip()).parent)
-                for line in out.splitlines()
-                if "libcudnn" in line and "=>" in line
-            }
-            outside = sorted(d for d in sysdirs if "site-packages" not in d)
-            if outside:
-                record(WARN, "  ^ ldconfig 缓存", f"cudnn 子库指向 {outside}（优先级独立于 LD_LIBRARY_PATH）")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        record(WARN, "  ^ nvidia-cudnn-cu12", f"{_ver('nvidia-cudnn-cu12') or '未装'}（建议 9.22.0.52）")
     else:
         record(FAIL, "cuDNN", f"查询失败: {msg[:110]}")
+
+# 版本号对不代表能用：libcudnn.so.9 只是 ~130KB 的 dispatch shim，实现都在
+# libcudnn_graph/_ops/_cnn/_engines_*.so.9 里，按 SONAME 运行时解析。
+# 直接 dlopen 一个子库，这是唯一能提前发现混载的办法 —— 否则要等到 critic 第一次
+# 前向才炸（TE FusedAttention: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED），而那已经是
+# 二十多分钟之后。
+try:
+    ctypes.CDLL("libcudnn_graph.so.9")
+    record(PASS, "cuDNN 子库", "libcudnn_graph.so.9 可加载")
+except OSError as e:
+    record(FAIL, "cuDNN 子库", f"libcudnn_graph.so.9 加载失败: {str(e)[:90]}")
+
+# ldconfig 缓存里的 cudnn 是致命的：它是独立于 LD_LIBRARY_PATH 的解析路径，加载器会
+# 把两边**交错**取用，于是 shim 是 pip 的 9.22、子库是系统的旧版。Miles 官方
+# Dockerfile 为此显式 apt-get remove libcudnn9-cuda-12（见其注释 "the loader
+# interleaves the two, so transformer_engine gets a mixed set"）。
+# 实测把 torch 自带目录前置到 LD_LIBRARY_PATH（且确认已传进 Ray worker）无效，
+# 只有摘掉缓存条目才行。
+try:
+    out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=20).stdout
+    sysdirs = sorted(
+        {
+            str(Path(line.split("=>")[-1].strip()).parent)
+            for line in out.splitlines()
+            if "libcudnn" in line and "=>" in line and "site-packages" not in line
+        }
+    )
+    if sysdirs:
+        record(FAIL, "ldconfig cudnn", f"缓存里有系统 cudnn: {sysdirs} —— 会与 pip 的混载，见下方修复")
+        globals()["_cudnn_ldconfig_dirs"] = sysdirs
+    else:
+        record(PASS, "ldconfig cudnn", "缓存内无系统 cudnn（正确 —— pip 的靠 rpath/LD_LIBRARY_PATH）")
+except (FileNotFoundError, subprocess.TimeoutExpired):
+    record(WARN, "ldconfig cudnn", "ldconfig 不可用，跳过")
 
 # ---------------------------------------------------------------------------
 section("5) cu13 包污染 —— cu12/cu13 共用安装路径，后装的覆盖前者 .so")
@@ -404,37 +406,35 @@ if n_fail:
     failed = {name for lvl, name, _ in results if lvl == FAIL}
     fixes: list[str] = []
 
-    if "cuDNN" in failed:
-        bundled = globals().get("_cudnn_bundled")
-        on_path = globals().get("_cudnn_on_path", True)
+    if "ldconfig cudnn" in failed or "cuDNN 子库" in failed or "cuDNN" in failed:
+        dirs = globals().get("_cudnn_ldconfig_dirs", [])
         lines = [
-            "cuDNN 版本不匹配。cuDNN 是本栈实际的 attention 后端（无 flash-attn，",
-            "  TE 走 cuDNN FusedAttention），所以这条要修。两个独立成因，都试一遍：",
+            "cuDNN 子库混载。libcudnn.so.9 只是 ~130KB 的 dispatch shim，实现在",
+            "  libcudnn_graph/_ops/_cnn/_engines_*.so.9，按 SONAME 运行时解析。ldconfig 缓存是",
+            "  独立于 LD_LIBRARY_PATH 的解析路径，加载器把两边交错取用 —— 于是 shim 用 pip 的",
+            "  9.22、子库用系统的旧版，TE 的 FusedAttention 在 critic 首次前向报",
+            "    cuDNN Error: ... CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED",
+            "  cuDNN 是本栈唯一的 attention 后端（无 flash-attn），所以这是致命的。",
             "",
-            "  (a) 包版本比 torch 编译期用的旧 —— pin 到 Miles 官方 cu12 分支的版本：",
-            "        pip install --force-reinstall --no-deps 'nvidia-cudnn-cu12==9.22.0.52'",
-            "        pip list 2>/dev/null | grep -iE '^(torch|numpy) '   # 确认没被换掉",
+            "  Miles 官方 Dockerfile 为同一问题显式 apt-get remove libcudnn9-cuda-12，其注释：",
+            '    "the loader interleaves the two, so transformer_engine gets a mixed set"',
+            "  注意：把 torch 自带目录前置到 LD_LIBRARY_PATH **不管用**（已实测，即使确认",
+            "  已传进 Ray worker，报错一字不变）。必须摘掉 ldconfig 缓存条目。",
         ]
-        if bundled and not on_path:
+        if dirs:
             lines += [
                 "",
-                "  (b) libcudnn.so.9 只是 ~130KB 的 dispatch shim，真正的实现在",
-                "      libcudnn_graph/_ops/_cnn/_engines_*.so.9 里，按 SONAME 运行时解析。",
-                "      系统的 ldconfig 缓存把这些子库指向了旧版本，且其优先级独立于",
-                "      LD_LIBRARY_PATH —— 清空 LD_LIBRARY_PATH 并不能解决。让 torch 自带的优先：",
-                f"        export LD_LIBRARY_PATH={bundled}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}",
-                '        python -c "import torch; print(torch.backends.cudnn.version())"',
+                f"  缓存里的系统 cudnn: {', '.join(dirs)}",
+                "    # 找到注册它的 conf 并注释掉（备份后）",
+                "    CONF=$(grep -rln 'cuda-12' /etc/ld.so.conf.d/ | head -1)",
+                "    cp \"$CONF\" \"$CONF.bak\"",
+                "    sed -i 's|^\\([^#].*\\)$|#\\1|' \"$CONF\"",
+                "    ldconfig",
+                "    ldconfig -p | grep libcudnn    # 应为空",
                 "",
-                "      验证通过后固化（新开 shell 才自动生效）：",
-                "        echo 'export LD_LIBRARY_PATH=" + bundled + "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' \\",
-                "          >> $CONDA_PREFIX/etc/conda/activate.d/cuda129.sh",
+                "  之后必须重启 Ray，worker 才会读到新缓存：",
+                "    ray stop --force && bash run_train.sh",
             ]
-        lines += [
-            "",
-            "  注：这条 FAIL 未必阻塞训练 —— TE 的 FusedAttention 走 libtransformer_engine.so",
-            "  自己链接的 cuDNN，不一定经过 torch 这条路径。修不动时可以直接 bash run_train.sh，",
-            "  TE 真有问题会明确报 cuDNN Error / FusedAttention not available。",
-        ]
         fixes.append("\n".join(lines))
 
     if "Megatron-LM 目录" in failed or "sglang 目录" in failed:
