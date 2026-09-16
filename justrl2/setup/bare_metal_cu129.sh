@@ -301,29 +301,39 @@ pip install --force-reinstall --no-deps "nvidia-cudnn-cu12==9.22.0.52"
 # 报错一字不变；只有摘掉缓存条目才生效。
 #
 # 本机的系统 cudnn 来自 CUDA toolkit 而非独立 apt 包（/usr/local/cuda-12.4/targets/
-# x86_64-linux/lib），所以注释掉注册它的 ld.so.conf.d 条目，而不是 apt remove。
-# 这会让同目录的 cublas/cufft 等也退出缓存 —— 本栈安全：CUDA_HOME 指向 conda 的
-# 12.9，torch/TE 用的是各自 pip 包里的库，靠 rpath 解析。pip 的 cudnn 本来就不进
-# ldconfig 缓存（靠 rpath + LD_LIBRARY_PATH），所以缓存里为空才是正确状态。
+# x86_64-linux/lib），没有 apt 包可以 remove。
+#
+# 做法：把该目录下的 libcudnn*.so* 移到子目录，其余库（cudart / cublas / cufft …）
+# 原地不动。
+# 绝对不要图省事去注释掉整个 ld.so.conf.d 条目 —— 实测那样会连带把 libcudart.so.12
+# 也踢出缓存，而 colocate 模式下 torch_memory_saver 的 hook 通过 LD_PRELOAD 注入、
+# 依赖 cudart；Triton 随后 fork 的 ptxas 继承了这个 LD_PRELOAD，于是
+#   ptxas: error while loading shared libraries: libcudart.so.12: cannot open ...
+# ptxas 起不动 -> NvidiaTool.from_path 吞掉 CalledProcessError 返回 None ->
+#   RuntimeError: Cannot find ptxas -> Capture cuda graph failed（engine 初始化即挂）
+# 报错信息完全指不到 cudart，极难回溯。
+moved_cudnn=0
 for conf in /etc/ld.so.conf.d/*.conf; do
   [ -f "$conf" ] || continue
-  # 只处理确实注册了 libcudnn 的目录，别误伤其他 conf（cublas/cufft 等照旧）
-  has_cudnn=0
   while read -r d; do
     [ -n "$d" ] || continue
     case "$d" in \#*) continue ;; esac
-    if [ -d "$d" ] && ls "$d"/libcudnn*.so* >/dev/null 2>&1; then has_cudnn=1; break; fi
+    [ -d "$d" ] || continue
+    ls "$d"/libcudnn*.so* >/dev/null 2>&1 || continue
+    echo "[setup] 退避系统 cudnn（保留同目录其他库）: $d"
+    mkdir -p "$d/_shadowed_cudnn"
+    mv "$d"/libcudnn*.so* "$d/_shadowed_cudnn/" 2>/dev/null || true
+    moved_cudnn=1
   done < "$conf"
-  [ "$has_cudnn" = 1 ] || continue
-  echo "[setup] 从 ldconfig 摘掉系统 cudnn: $conf"
-  cp -n "$conf" "$conf.justrl2.bak" 2>/dev/null || true
-  sed -i 's|^\([^#].*\)$|#\1  # JustRL2: shadows pip cudnn, TE mixes sub-libraries|' "$conf"
 done
-ldconfig
+[ "$moved_cudnn" = 1 ] && ldconfig
 if ldconfig -p | grep -q libcudnn; then
   echo "WARN: ldconfig 缓存里仍有 libcudnn，TE 可能混载子库："
   ldconfig -p | grep libcudnn | head -3
 fi
+# cudart 必须还在 —— 见上面 ptxas / LD_PRELOAD 那段
+ldconfig -p | grep -q libcudart \
+  || echo "WARN: libcudart 不在 ldconfig 缓存里，LD_PRELOAD 下的 ptxas 会起不来"
 
 # torch 自带 cudnn 目录仍然前置（缓存清空后由它提供子库）。
 # 幂等：反复 activate 不重复叠加。

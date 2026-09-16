@@ -306,8 +306,38 @@ else:
         record(FAIL, "ptxas", f"TRITON_PTXAS_PATH={_ptxas} 不可执行")
     elif found:
         record(PASS, "ptxas", f"{found}（train.sh 会自动探测并传给 Ray worker）")
+        _ptxas = str(found)
     else:
         record(FAIL, "ptxas", f"未找到，试过 {[str(p) for p in cands]} —— cuda graph capture 会失败")
+
+# ptxas 必须在 LD_PRELOAD 注入的情况下也能起来。colocate 模式下 actor_group.py 会把
+# torch_memory_saver 的 hook .so 通过 LD_PRELOAD 注入，Triton fork 出的 ptxas 继承它；
+# 那个 hook 依赖 libcudart，若 cudart 不在 ldconfig 缓存里（例如为了处理 cudnn 而把整个
+# ld.so.conf.d 条目注释掉了），ptxas 就起不来。而 NvidiaTool.from_path 只是吞掉
+# CalledProcessError 返回 None，最终报成 "Cannot find ptxas" —— 完全指不到 cudart。
+if _ptxas and os.access(_ptxas, os.X_OK):
+    try:
+        import torch_memory_saver
+
+        hook = Path(
+            Path(torch_memory_saver.__file__).parent.parent,
+            "torch_memory_saver_hook_mode_preload.abi3.so",
+        )
+        if hook.exists():
+            env = {**os.environ, "LD_PRELOAD": str(hook)}
+            r = subprocess.run([_ptxas, "--version"], capture_output=True, text=True, timeout=30, env=env)
+            if r.returncode == 0:
+                record(PASS, "ptxas + LD_PRELOAD", "colocate 的 memory-saver hook 下可执行")
+            else:
+                miss = re.search(r"(lib[\w.]+\.so[\w.]*): cannot open", (r.stderr or "") + (r.stdout or ""))
+                extra = f"缺 {miss.group(1)}" if miss else ((r.stderr or r.stdout or "")[:90]).strip()
+                record(FAIL, "ptxas + LD_PRELOAD", f"起不来（{extra}）—— engine 会报 Cannot find ptxas")
+        else:
+            record(WARN, "ptxas + LD_PRELOAD", "找不到 memory-saver hook，跳过")
+    except ImportError:
+        record(WARN, "ptxas + LD_PRELOAD", "torch_memory_saver 未装，跳过")
+    except subprocess.TimeoutExpired:
+        record(WARN, "ptxas + LD_PRELOAD", "执行超时")
 
 # ---------------------------------------------------------------------------
 section("7) apex fused wgrad —— 决定要不要 NO_GRAD_ACC_FUSION=1")
