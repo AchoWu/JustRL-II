@@ -603,13 +603,20 @@ class SGLangEngine(RayActor):
         post_process_quantization: bool = False,
         post_load_weights: bool = False,
     ):
-        """
-        Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
-        Note: The model should be on GPUs rather than CPU for this functionality to work properly.
-        If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
+        """Post-process weights on the engine: int4/fp4 finalize, post_load_weights.
+
+        Removed from newer sglang, where the begin/end_weight_update session does
+        exactly this work — begin restores in-place-packed weights (the old
+        restore_weights_before_load) and end runs the quant finalize plus
+        post_load_weights when load_weights was bypassed. Requesting it there gets
+
+            404 Client Error: Not Found for url: .../post_process_weights
+
+        so treat a missing endpoint as "already handled by the session" and no-op.
+        Kept for builds that still expose it and have no session protocol.
         """
 
-        return self._make_request(
+        return self._make_optional_request(
             "post_process_weights",
             {
                 "restore_weights_before_load": restore_weights_before_load,
