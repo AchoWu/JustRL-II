@@ -342,6 +342,20 @@ case ":${LD_LIBRARY_PATH:-}:" in
   *) export LD_LIBRARY_PATH="${CUDNN_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
 esac
 
+# Triton 的 ptxas。Triton 按 TRITON_PTXAS_PATH 或 PATH 查找，而 Ray worker 的 PATH
+# 不含 conda bin，于是 SGLang engine 在 cuda graph capture 阶段报
+#   RuntimeError: Cannot find ptxas  ->  Capture cuda graph failed
+# train.sh 也会自己探测并通过 runtime_env 传给 worker，这里固化是为了本地 python
+# 调用（prepare_model.sh、eval.py）也能用。优先 Triton 自带那份（版本配套）。
+cat >> "$CONDA_PREFIX/etc/conda/activate.d/cuda129.sh" <<'EOF'
+if [ -z "${TRITON_PTXAS_PATH:-}" ]; then
+  for _p in "$CONDA_PREFIX/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas" \
+            "$CONDA_PREFIX/bin/ptxas"; do
+    [ -x "$_p" ] && export TRITON_PTXAS_PATH="$_p" && break
+  done
+fi
+EOF
+
 python -c "
 import ctypes, torch
 # shim 的版本号对不代表能用：实现都在子库里，按 SONAME 运行时解析。

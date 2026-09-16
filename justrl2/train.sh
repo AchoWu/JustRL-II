@@ -273,9 +273,24 @@ NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -c 'NV[0-9]' || true); NVLI
 #   cuDNN Error: ... CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
 LD_LIBRARY_PATH_ENV=""
 [ -n "${LD_LIBRARY_PATH:-}" ] && LD_LIBRARY_PATH_ENV="\"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH}\","
+# Same reasoning for ptxas: Triton shells out to it to assemble PTX, and a Ray worker's
+# PATH does not necessarily contain the CUDA (or conda) bin directory that has it. When
+# Triton cannot find it the SGLang engines die during cuda-graph capture with
+#   RuntimeError: Cannot find ptxas  ->  Capture cuda graph failed
+# Autodetect when unset, preferring Triton's own copy (version-matched to Triton) over
+# the toolkit's. Both keys are omitted when empty, so the image path is unaffected.
+TRITON_PTXAS_ENV=""
+if [ -z "${TRITON_PTXAS_PATH:-}" ]; then
+  for _p in "$(python3 -c 'import triton,os;print(os.path.join(os.path.dirname(triton.__file__),"backends","nvidia","bin","ptxas"))' 2>/dev/null)" \
+            "${CUDA_HOME:-/usr/local/cuda}/bin/ptxas"; do
+    [ -n "$_p" ] && [ -x "$_p" ] && TRITON_PTXAS_PATH="$_p" && break
+  done
+fi
+[ -n "${TRITON_PTXAS_PATH:-}" ] && TRITON_PTXAS_ENV="\"TRITON_PTXAS_PATH\": \"${TRITON_PTXAS_PATH}\","
 RUNTIME_ENV_JSON="{
   \"env_vars\": {${DSPARK_ENV}
     ${LD_LIBRARY_PATH_ENV}
+    ${TRITON_PTXAS_ENV}
     \"PYTHONPATH\": \"${PYTHONPATH}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)\",

@@ -285,6 +285,30 @@ if _ver("flashinfer-jit-cache"):
 else:
     record(WARN, "flashinfer-jit-cache", "未装 —— flashinfer 会运行时 JIT，慢且多 worker 打架")
 
+# Triton 要 fork ptxas 去汇编 PTX。它按 TRITON_PTXAS_PATH 或 PATH 查找，而 Ray worker
+# 的 PATH 不一定含 conda/CUDA 的 bin —— 那时 SGLang engine 会在 cuda graph capture 阶段
+# 报 "RuntimeError: Cannot find ptxas" -> "Capture cuda graph failed"。
+# train.sh 会自动探测并通过 runtime_env 传给 worker，这里只报告结果。
+_ptxas = os.environ.get("TRITON_PTXAS_PATH", "")
+if _ptxas and os.access(_ptxas, os.X_OK):
+    record(PASS, "ptxas", f"TRITON_PTXAS_PATH={_ptxas}")
+else:
+    cands = []
+    try:
+        import triton
+
+        cands.append(Path(Path(triton.__file__).parent, "backends", "nvidia", "bin", "ptxas"))
+    except ImportError:
+        pass
+    cands.append(Path(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "ptxas"))
+    found = next((p for p in cands if p.exists() and os.access(p, os.X_OK)), None)
+    if _ptxas:
+        record(FAIL, "ptxas", f"TRITON_PTXAS_PATH={_ptxas} 不可执行")
+    elif found:
+        record(PASS, "ptxas", f"{found}（train.sh 会自动探测并传给 Ray worker）")
+    else:
+        record(FAIL, "ptxas", f"未找到，试过 {[str(p) for p in cands]} —— cuda graph capture 会失败")
+
 # ---------------------------------------------------------------------------
 section("7) apex fused wgrad —— 决定要不要 NO_GRAD_ACC_FUSION=1")
 # ---------------------------------------------------------------------------
