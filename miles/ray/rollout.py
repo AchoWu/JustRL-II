@@ -149,6 +149,20 @@ class ServerGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            # An actor-level runtime_env *replaces* the job-level env_vars rather than
+            # merging with them, so anything this dict omits is simply absent from the
+            # engine — even when `ray job submit --runtime-env-json` set it. Toolchain
+            # locations have to be carried through explicitly, or the engines fail where
+            # the training actors (which inherit the full environment via actor_group)
+            # succeed:
+            #   TRITON_PTXAS_PATH unset -> Triton cannot fork ptxas ->
+            #       "Cannot find ptxas" -> "Capture cuda graph failed" at engine init
+            #   LD_LIBRARY_PATH unset   -> a stale system cuDNN/NCCL wins the loader
+            # Only forwarded when actually set, so default deployments are unchanged.
+            for key in ("TRITON_PTXAS_PATH", "TRITON_PTXAS_BLACKWELL_PATH", "LD_LIBRARY_PATH", "CUDA_HOME"):
+                value = os.environ.get(key)
+                if value:
+                    env_vars.setdefault(key, value)
             env_vars.update(dumper_utils.get_sglang_env(self.args))
 
             rollout_engine = RolloutRayActor.options(

@@ -58,6 +58,18 @@ class RayTrainGroup:
             **self.args.train_env_vars,
         }
 
+        # An actor-level runtime_env *replaces* the job-level env_vars instead of merging,
+        # so toolchain locations must be carried through explicitly or they are missing in
+        # the actor even when `ray job submit --runtime-env-json` set them. LD_LIBRARY_PATH
+        # decides which cuDNN sub-libraries the loader picks (libcudnn.so.9 is a dispatch
+        # shim; libcudnn_graph/_ops/_cnn resolve by SONAME at runtime), and a mismatch kills
+        # TE's FusedAttention mid-forward with CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED.
+        # Only forwarded when set, so default deployments are unchanged.
+        for key in ("LD_LIBRARY_PATH", "TRITON_PTXAS_PATH", "TRITON_PTXAS_BLACKWELL_PATH", "CUDA_HOME"):
+            value = os.environ.get(key)
+            if value:
+                env_vars.setdefault(key, value)
+
         if source_patcher_config := self.args.dumper_source_patcher_config_train:
             env_vars["DUMPER_SOURCE_PATCHER_CONFIG"] = source_patcher_config
 
