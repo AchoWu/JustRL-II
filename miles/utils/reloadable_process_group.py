@@ -108,6 +108,74 @@ def monkey_patch_torch_dist():
     dist.P2POp.__init__ = get_new_p2pop_function(dist.P2POp.__init__)
 
 
+class _CompletedWork(dist.Work):
+    """A Work that is already finished.
+
+    Returned by `ReloadableProcessGroup._fwd` in place of a `None` from the inner
+    process group. Since torch 2.8 `ProcessGroupNCCL::collectiveCoalesced` ends with
+
+        return asyncOp ? work : nullptr;
+
+    so a synchronous coalesced collective hands back `nullptr` -> Python `None`.
+    `PyProcessGroup`'s `WORK_OVERRIDE` macro does not check for that: it feeds the
+    value straight into `c10::make_intrusive<PyWorkHolder>(o)`, and because `Work`'s
+    holder is declared `PYBIND11_DECLARE_HOLDER_TYPE(..., true)`, `None` casts to an
+    *empty* `intrusive_ptr` rather than being rejected. `PyWorkHolder::wait` then does
+    `work_->wait(timeout)` with no null check and segfaults on every rank at once
+    (confirmed from a core dump: rdi=0x0 at PyWorkHolder::wait+7).
+
+    Upgrading torch does not fix this. The `o.is_none()` guard added in pytorch#189817
+    is absent in 2.13 and present in 2.14, but `reduce_scatter_tensor_coalesced` is one
+    of the sites that bypass `WORK_OVERRIDE` with a hand-written dual-name lookup
+    (`reduce_scatter_single_coalesced` first, then `reduce_scatter_tensor_coalesced`),
+    and that path is still unguarded in 2.14. The wrapper has to avoid `None` itself.
+    """
+
+    def wait(self, timeout=None):
+        return True
+
+    def is_completed(self):
+        return True
+
+    def is_success(self):
+        return True
+
+    def exception(self):
+        return None
+
+
+# Methods whose C++ counterpart returns a `Work`. A `None` from any of these is what
+# triggers the null-deref above, so it gets replaced by `_CompletedWork`. Deliberately
+# a whitelist: anything not listed keeps the plain pass-through, so accessors such as
+# `_get_backend_name` (and any method a future torch adds) are unaffected.
+_WORK_RETURNING_METHODS = frozenset(
+    {
+        "allgather",
+        "_allgather_base",
+        "allgather_coalesced",
+        "allgather_into_tensor_coalesced",
+        "allgather_into_single_coalesced",
+        "allreduce",
+        "allreduce_coalesced",
+        "alltoall",
+        "alltoall_base",
+        "barrier",
+        "broadcast",
+        "gather",
+        "recv",
+        "recv_anysource",
+        "reduce",
+        "reduce_scatter",
+        "_reduce_scatter_base",
+        "reduce_scatter_tensor_coalesced",
+        "reduce_scatter_single_coalesced",
+        "scatter",
+        "send",
+        "_end_coalescing",
+    }
+)
+
+
 class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     GROUPS = {}
 
@@ -179,7 +247,32 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         if inner is None:
             raise RuntimeError("ReloadableProcessGroup: inner PG is None, call reload() first.")
         with _wrap_low_level_call():
-            return getattr(inner, method)(*args, **kwargs)
+            result = getattr(inner, method)(*args, **kwargs)
+        # Never hand `None` back to PyProcessGroup for a Work-returning collective:
+        # it becomes an empty intrusive_ptr and segfaults later in PyWorkHolder::wait.
+        # See _CompletedWork for the full chain.
+        if result is None and method in _WORK_RETURNING_METHODS:
+            return _CompletedWork()
+        return result
+
+    def _fwd_first_available(self, methods, *args, **kwargs):
+        """Forward to the first name the inner PG actually implements.
+
+        torch is mid-rename here: `reduce_scatter_tensor` -> `reduce_scatter_single`
+        (the 2.13 runtime already emits a FutureWarning for the old name), and
+        `PyProcessGroup` looks up the `*_single*` spelling on this object before the
+        legacy one. Defining only one spelling makes the wrapper's coverage depend on
+        which torch is installed, so both are defined and resolved against the inner
+        PG at call time -- a plain `getattr(inner, new_name)` would raise
+        AttributeError on a runtime that only has the old name.
+        """
+        inner = self.group
+        if inner is None:
+            raise RuntimeError("ReloadableProcessGroup: inner PG is None, call reload() first.")
+        for name in methods:
+            if hasattr(inner, name):
+                return self._fwd(name, *args, **kwargs)
+        raise AttributeError(f"ReloadableProcessGroup: inner PG implements none of {methods}")
 
     def barrier(self, *a, **kw):
         return self._fwd("barrier", *a, **kw)
@@ -205,8 +298,25 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def allgather_coalesced(self, *a, **kw):
         return self._fwd("allgather_coalesced", *a, **kw)
 
+    def reduce_scatter_tensor_coalesced(self, *a, **kw):
+        return self._fwd_first_available(
+            ("reduce_scatter_single_coalesced", "reduce_scatter_tensor_coalesced"), *a, **kw
+        )
+
+    def reduce_scatter_single_coalesced(self, *a, **kw):
+        return self._fwd_first_available(
+            ("reduce_scatter_single_coalesced", "reduce_scatter_tensor_coalesced"), *a, **kw
+        )
+
     def allgather_into_tensor_coalesced(self, *a, **kw):
-        return self._fwd("allgather_into_tensor_coalesced", *a, **kw)
+        return self._fwd_first_available(
+            ("allgather_into_single_coalesced", "allgather_into_tensor_coalesced"), *a, **kw
+        )
+
+    def allgather_into_single_coalesced(self, *a, **kw):
+        return self._fwd_first_available(
+            ("allgather_into_single_coalesced", "allgather_into_tensor_coalesced"), *a, **kw
+        )
 
     def gather(self, *a, **kw):
         return self._fwd("gather", *a, **kw)
@@ -219,9 +329,6 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
 
     def _reduce_scatter_base(self, *a, **kw):
         return self._fwd("_reduce_scatter_base", *a, **kw)
-
-    def reduce_scatter_tensor_coalesced(self, *a, **kw):
-        return self._fwd("reduce_scatter_tensor_coalesced", *a, **kw)
 
     def alltoall_base(self, *a, **kw):
         return self._fwd("alltoall_base", *a, **kw)
