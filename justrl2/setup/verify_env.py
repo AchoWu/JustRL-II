@@ -4,7 +4,7 @@
     python justrl2/setup/verify_env.py
 
 只做 import 和版本检查，不占显存、不跑 kernel，几秒钟出结果。
-配套 check_deps.py（列缺失的纯 Python 依赖）—— 两个都干净了再去跑 run_train.sh。
+配套 check_deps.py（列缺失的纯 Python 依赖）—— 两个都干净了再去跑 run_test.sh。
 
 每条 FAIL 都对应一个已经踩过的坑，且大多数会在很晚才暴露（train.sh 跑起来、
 init_process_group、甚至 save_checkpoint 时），所以在这里拦住是值得的。
@@ -543,7 +543,7 @@ if n_fail:
                 "  Triton fork 的 ptxas 继承它后起不来，最终报成 'Cannot find ptxas'，指不到 cudart。",
                 "",
                 "  之后必须重启 Ray，worker 才会读到新缓存：",
-                "    ray stop --force && bash run_train.sh",
+                "    ray stop --force && bash run_test.sh",
             ]
         fixes.append("\n".join(lines))
 
@@ -572,7 +572,7 @@ if n_fail:
         lines += [
             "",
             "  之后必须重启 Ray，worker 才会用新的加载结果：",
-            "    ray stop --force && bash run_train.sh",
+            "    ray stop --force && bash run_test.sh",
         ]
         fixes.append("\n".join(lines))
 
@@ -617,5 +617,5 @@ if n_fail:
 
 print("\n没有 FAIL。下一步：")
 print("  python justrl2/setup/check_deps.py --pip   # 补齐纯 Python 依赖")
-print("  bash run_train.sh                          # 3-rollout 冒烟，自带启动检查")
+print("  bash run_test.sh                           # 3-rollout 冒烟，自带启动检查")
 sys.exit(0)
