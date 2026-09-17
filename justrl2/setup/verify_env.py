@@ -197,6 +197,45 @@ try:
 except OSError as e:
     record(FAIL, "cuDNN 子库", f"libcudnn_graph.so.9 加载失败: {str(e)[:90]}")
 
+# 「能载入一个」不等于「只载入了一套」。上面那条 CDLL 命中 LD_LIBRARY_PATH 最前面的
+# 那份就 PASS，可致命的情形恰恰是**两份同时在进程里**：
+#   .../site-packages/nvidia/cudnn/lib/libcudnn.so.9   (pip 9.22 的 dispatch shim)
+#   $CONDA_PREFIX/lib/.../libcudnn.so.9.14.0           (conda install cudnn 带来的实现)
+# 两者 SONAME 都是 libcudnn.so.9，先以 RTLD_GLOBAL 载入的赢得 cudnnBackend* 的符号
+# 解析；9.14 的实现拿到调用后按 SONAME dlopen 自己那套子库，却从 LD_LIBRARY_PATH
+# 拿到 9.22 的，于是 TE FusedAttention 在 critic 第一次前向报
+#   cuDNN Error: ... CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+# 而那已经是二十多分钟之后（实测一次 70 分钟）。
+#
+# 直接读 /proc/self/maps 看实际映射，这是唯一能区分「一套」和「两套」的办法：
+# 版本号、CDLL、LD_LIBRARY_PATH 都看不出来。注意 maps 给的是 realpath，所以挪进
+# 子目录（lib/_shadowed/）的那份照样会现原形 —— 实测挪子目录并不能让它退出视野。
+# 依赖上面 section 4 已经 import 过 transformer_engine.pytorch（TE 是唯一的
+# cuDNN 消费者），所以这里不重复 import。
+try:
+    _maps = Path("/proc/self/maps")
+    if not _maps.exists():
+        record(WARN, "cuDNN 单一来源", "/proc/self/maps 不可读，跳过")
+    else:
+        _libs = {
+            Path(line.split()[-1])
+            for line in _maps.read_text().splitlines()
+            if "libcudnn" in line and line.split()[-1].startswith("/")
+        }
+        _dirs = sorted({str(p.parent) for p in _libs})
+        if len(_dirs) > 1:
+            record(FAIL, "cuDNN 单一来源", f"进程里有 {len(_dirs)} 个来源目录 —— 必然混载")
+            for _d in _dirs:
+                _names = sorted(p.name for p in _libs if str(p.parent) == _d)
+                record(WARN, f"  ^ {_d}", ", ".join(_names))
+            globals()["_cudnn_multi_dirs"] = _dirs
+        elif _dirs:
+            record(PASS, "cuDNN 单一来源", f"{len(_libs)} 个库全部来自 {_dirs[0]}")
+        else:
+            record(WARN, "cuDNN 单一来源", "进程里没有 libcudnn 映射 —— TE 是否真的 import 成功？")
+except OSError as e:
+    record(WARN, "cuDNN 单一来源", f"检查失败: {str(e)[:90]}")
+
 # ldconfig 缓存里的 cudnn 是致命的：它是独立于 LD_LIBRARY_PATH 的解析路径，加载器会
 # 把两边**交错**取用，于是 shim 是 pip 的 9.22、子库是系统的旧版。Miles 官方
 # Dockerfile 为此显式 apt-get remove libcudnn9-cuda-12（见其注释 "the loader
@@ -205,11 +244,22 @@ except OSError as e:
 # 只有摘掉缓存条目才行。
 try:
     out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=20).stdout
+    # 白名单是「pip 的 cudnn 那**一个**目录」，不是宽泛的 site-packages —— 后者会把
+    # 别的 site-packages 里的第二份 cudnn 一起放过，而那和系统那份一样会混载。
+    _pip_cudnn_dir = None
+    try:
+        import nvidia.cudnn
+
+        _pip_cudnn_dir = str(Path(list(nvidia.cudnn.__path__)[0], "lib").resolve())
+    except Exception:
+        pass
     sysdirs = sorted(
         {
-            str(Path(line.split("=>")[-1].strip()).parent)
+            d
             for line in out.splitlines()
-            if "libcudnn" in line and "=>" in line and "site-packages" not in line
+            if "libcudnn" in line and "=>" in line
+            for d in [str(Path(line.split("=>")[-1].strip()).resolve().parent)]
+            if d != _pip_cudnn_dir
         }
     )
     if sysdirs:
@@ -479,16 +529,51 @@ if n_fail:
             lines += [
                 "",
                 f"  缓存里的系统 cudnn: {', '.join(dirs)}",
-                "    # 找到注册它的 conf 并注释掉（备份后）",
-                "    CONF=$(grep -rln 'cuda-12' /etc/ld.so.conf.d/ | head -1)",
-                "    cp \"$CONF\" \"$CONF.bak\"",
-                "    sed -i 's|^\\([^#].*\\)$|#\\1|' \"$CONF\"",
+                "    # 只挪 libcudnn*，同目录的 cudart/cublas/cufft 必须留在原地",
+                *[
+                    f'    mkdir -p "{d}/_shadowed_cudnn" && mv "{d}"/libcudnn*.so* "{d}/_shadowed_cudnn/"'
+                    for d in dirs
+                ],
                 "    ldconfig",
                 "    ldconfig -p | grep libcudnn    # 应为空",
+                "    ldconfig -p | grep libcudart   # 必须还在（见下）",
+                "",
+                "  切勿注释掉整个 ld.so.conf.d 条目图省事：那会连带把 libcudart.so.12 踢出缓存，",
+                "  而 colocate 下 torch_memory_saver 的 hook 经 LD_PRELOAD 注入且依赖 cudart，",
+                "  Triton fork 的 ptxas 继承它后起不来，最终报成 'Cannot find ptxas'，指不到 cudart。",
                 "",
                 "  之后必须重启 Ray，worker 才会读到新缓存：",
                 "    ray stop --force && bash run_train.sh",
             ]
+        fixes.append("\n".join(lines))
+
+    if "cuDNN 单一来源" in failed:
+        dirs = globals().get("_cudnn_multi_dirs", [])
+        lines = [
+            "进程里同时载入了两套 cuDNN。两份的 SONAME 都是 libcudnn.so.9，先以 RTLD_GLOBAL",
+            "  载入的那份赢得 cudnnBackend* 的符号解析；它再按 SONAME dlopen 自己那套子库时",
+            "  却拿到另一份的版本，于是 TE FusedAttention 在 critic 首次前向报",
+            "    cuDNN Error: ... CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED",
+            "",
+            "  最常见来源是 bare_metal_cu129.sh 里的 `conda install -c nvidia cudnn`（为了拿",
+            "  cudnn.h 给 TE 的 torch 扩展编译）—— 它同时把一整套运行时库装进 $CONDA_PREFIX/lib。",
+            "  这和脚本里 nccl 那段警告是同一个机制，只是 cudnn 更致命（唯一的 attention 后端）。",
+            "",
+            "  修法：头文件留下，运行时库移出 conda prefix。注意必须移到 prefix **之外** ——",
+            "  实测挪到 $CONDA_PREFIX/lib 的子目录（如 lib/_shadowed/）仍会被载入。",
+            "    mkdir -p /root/cudnn_conda_backup",
+            '    mv "$CONDA_PREFIX"/lib/libcudnn*.so* /root/cudnn_conda_backup/',
+            "    # 复查：下面应只打出 nvidia/cudnn/lib 一个目录",
+            "    python -c \"import torch, transformer_engine.pytorch;\"\\",
+            "\"print(sorted({l.split()[-1] for l in open('/proc/self/maps') if 'libcudnn' in l}))\"",
+        ]
+        if dirs:
+            lines += ["", f"  本次检测到的来源目录: {', '.join(dirs)}"]
+        lines += [
+            "",
+            "  之后必须重启 Ray，worker 才会用新的加载结果：",
+            "    ray stop --force && bash run_train.sh",
+        ]
         fixes.append("\n".join(lines))
 
     if "Megatron-LM 目录" in failed or "sglang 目录" in failed:
