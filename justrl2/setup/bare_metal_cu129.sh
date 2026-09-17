@@ -335,6 +335,38 @@ fi
 ldconfig -p | grep -q libcudart \
   || echo "WARN: libcudart 不在 ldconfig 缓存里，LD_PRELOAD 下的 ptxas 会起不来"
 
+# 第二个 cudnn 来源：本脚本第 6 节 `conda install -c nvidia cudnn`（为了拿 cudnn.h
+# 给 TE 的 torch 扩展编译）同时装了一整套运行时库到 $CONDA_PREFIX/lib。头文件是
+# 必需的，运行时库是有害的 —— 和上面 nccl 那段是同一个机制，只是 cudnn 更致命，
+# 因为它是本栈唯一的 attention 后端。
+#
+# 两份的 SONAME 都是 libcudnn.so.9，先以 RTLD_GLOBAL 载入的那份赢得 cudnnBackend*
+# 的符号解析；conda 的 9.14 实现拿到调用后按 SONAME dlopen 自己那套子库，却从
+# LD_LIBRARY_PATH 拿到 pip 的 9.22，于是 TE FusedAttention 在 critic 首次前向报
+#   cuDNN Error: ... CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+# 注意这跟上面 ldconfig 那一步是**两个独立的坑**，都要堵：系统那份（cuda-12.4 的
+# 9.5.1）走 ldconfig 缓存，conda 这份走 $CONDA_PREFIX/lib。
+#
+# 必须移到 $CONDA_PREFIX **之外**。实测挪到 lib 的子目录（lib/_shadowed/）不够 ——
+# 2609-09-15 挪过一次，2609-09-16 的 run 里 _shadowed/libcudnn.so.9.14.0 照样出现在
+# /proc/<pid>/maps 里。子目录为什么仍被搜到尚未查清（LD_LIBRARY_PATH 里没有它），
+# 所以这里不赌机制，直接搬出 prefix —— 那是实测干净的做法。
+CUDNN_CONDA_BACKUP="${CUDNN_CONDA_BACKUP:-/root/cudnn_conda_backup}"
+if ls "$CONDA_PREFIX"/lib/libcudnn*.so* >/dev/null 2>&1; then
+  echo "[setup] 把 conda 的 cudnn 运行时库搬出 prefix（保留 cudnn.h）: $CUDNN_CONDA_BACKUP"
+  mkdir -p "$CUDNN_CONDA_BACKUP"
+  mv "$CONDA_PREFIX"/lib/libcudnn*.so* "$CUDNN_CONDA_BACKUP/"
+fi
+# 历史遗留：早期版本的本脚本/手工操作可能把它们挪进了 lib 的子目录，那样无效（见上）
+for _stale in "$CONDA_PREFIX"/lib/_shadowed "$CONDA_PREFIX"/lib/_shadowed_cudnn; do
+  [ -d "$_stale" ] || continue
+  echo "[setup] 发现 prefix 内的旧退避目录（无效，仍会被载入），搬出: $_stale"
+  mkdir -p "$CUDNN_CONDA_BACKUP"
+  mv "$_stale" "$CUDNN_CONDA_BACKUP/"
+done
+[ -f "$CONDA_PREFIX/include/cudnn.h" ] \
+  || echo "WARN: $CONDA_PREFIX/include/cudnn.h 不见了 —— TE 的 torch 扩展重编会失败"
+
 # torch 自带 cudnn 目录仍然前置（缓存清空后由它提供子库）。
 # 幂等：反复 activate 不重复叠加。
 CUDNN_LIB=$(python -c "import nvidia.cudnn, os; print(os.path.join(list(nvidia.cudnn.__path__)[0], 'lib'))")
@@ -367,12 +399,24 @@ fi
 EOF
 
 python -c "
-import ctypes, torch
+import ctypes, pathlib, torch
 # shim 的版本号对不代表能用：实现都在子库里，按 SONAME 运行时解析。
 ctypes.CDLL('libcudnn_graph.so.9')
 v = torch.backends.cudnn.version()
 print('cudnn', v, '(子库可加载) | nccl', torch.cuda.nccl.version())
 assert v and v >= 92000, f'cudnn {v} 异常 —— 期望 >= 92000，见上方 ldconfig 说明'
+# 上面三行全过也可能是坏的：致命情形是进程里**同时**有两套 cudnn（SONAME 都是
+# libcudnn.so.9，先载入的赢符号解析，子库版本却对不上）。只有读 maps 能区分。
+# TE 是 cudnn 的实际消费者，必须 import 它才能看到完整的加载结果。
+import transformer_engine.pytorch  # noqa: F401
+libs = {pathlib.Path(l.split()[-1]) for l in open('/proc/self/maps')
+        if 'libcudnn' in l and l.split()[-1].startswith('/')}
+dirs = sorted({str(p.parent) for p in libs})
+print('cudnn 来源目录:', *dirs, sep='\n  ')
+assert len(dirs) == 1, (
+    f'进程里有 {len(dirs)} 套 cudnn，必然混载 -> TE FusedAttention 会在 critic 首次'
+    ' 前向报 CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED。见上方把 conda cudnn 搬出 prefix 那段。'
+)
 "
 
 # ---------------------------------------------------------------------------
