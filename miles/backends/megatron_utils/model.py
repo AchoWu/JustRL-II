@@ -625,26 +625,54 @@ def train_one_step(
                 _lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else float("nan")
             except Exception:  # 诊断绝不能让训练崩
                 _lr = float("nan")
+            # weight 和 bias 都要看。V = w·h + b，dV/db = 1 恒成立，而 dV/dw = h。
+            # 若 bias 有梯度而 weight 没有，说明反向链是通的、问题在 h（被 detach、
+            # 或该 rank 的 h 恰好为零）；若两者都没有，是整条链没接上（loss mask
+            # 全零、或这个 param 不在本 rank 的 bucket 里）。
             for _chunk in model:
                 for _n, _p in _chunk.named_parameters():
-                    if not _n.endswith("output_layer.weight"):
+                    if not (_n.endswith("output_layer.weight") or _n.endswith("output_layer.bias")):
                         continue
                     _g = getattr(_p, "main_grad", None)
+                    _gsrc = "main_grad"
                     if _g is None:
                         _g = _p.grad
-                    _vh_before = float(_p.detach().abs().max())
+                        _gsrc = "grad"
+                    _absmax = float(_p.detach().abs().max())
+                    if _n.endswith("output_layer.weight"):
+                        _vh_before = _absmax
                     logger.info(
-                        "[vh-diag] rollout=%s pre-step %s shape=%s w_absmax=%.6g grad=%s lr=%.3g",
+                        "[vh-diag] rollout=%s pre-step %s shape=%s absmax=%.6g %s=%s lr=%.3g",
                         rollout_id,
-                        _n,
+                        _n.rsplit(".", 2)[-2] + "." + _n.rsplit(".", 1)[-1],
                         tuple(_p.shape),
-                        _vh_before,
+                        _absmax,
+                        _gsrc,
                         "None" if _g is None else f"{float(_g.detach().abs().max()):.6g}",
                         _lr,
                     )
-                    break
                 if _vh_before is not None:
                     break
+
+        if _vh_diag:
+            # 头是否真的在优化器的参数集合里。grad=0 的另一个候选解释是这个 param
+            # 根本没被 get_megatron_optimizer 收进任何 param_group（那样 main_grad
+            # 也不会被 finalize_model_grads 填），此时 step() 当然不会动它。
+            try:
+                _ids = set()
+                for _chunk in model:
+                    for _n, _p in _chunk.named_parameters():
+                        if _n.endswith("output_layer.weight"):
+                            _ids.add(id(_p))
+                _in_opt = sum(
+                    1
+                    for _grp in (optimizer.param_groups or [])
+                    for _p in _grp.get("params", [])
+                    if id(_p) in _ids
+                )
+                logger.info("[vh-diag] rollout=%s head-in-optimizer=%s", rollout_id, _in_opt)
+            except Exception as _e:
+                logger.info("[vh-diag] rollout=%s head-in-optimizer check failed: %s", rollout_id, _e)
 
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
