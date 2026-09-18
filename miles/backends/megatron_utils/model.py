@@ -349,6 +349,20 @@ def forward_only(
             and getattr(model, "role", "actor") != "critic"
         )
 
+        # Value-head diagnostic; see the matching block in the training forward_step.
+        # This is the forward_only path (get_values), which is where the all-zero
+        # output_layer input was actually observed, so it needs the same gate logged.
+        if not getattr(forward_step, "_vh_gate_logged", False):
+            forward_step._vh_gate_logged = True
+            logger.info(
+                "[vh-diag] fwd-only chunked-output gate: use_chunked=%s role=%r "
+                "log_probs_chunk_size=%s is_last_stage=%s",
+                use_chunked_output,
+                getattr(model, "role", "<unset>"),
+                getattr(args, "log_probs_chunk_size", -1),
+                mpu.is_pipeline_last_stage(),
+            )
+
         if use_chunked_output:
             unwrapped = model
             while hasattr(unwrapped, "module"):
@@ -544,6 +558,25 @@ def train_one_step(
                 and mpu.is_pipeline_last_stage()
                 and getattr(model, "role", "actor") != "critic"
             )
+
+            # Value-head diagnostic. This gate decides whether post_process is
+            # switched off, i.e. whether the model runs its output_layer at all. If
+            # the critic ever takes the chunked path, its output_layer is bypassed
+            # and the head sees nothing -- which would explain an all-zero input and
+            # a weight that never trains. role is stamped on the DDP chunk
+            # (model.py:1085) and this closure receives that same chunk from
+            # megatron's pipeline, but that is an inference, so log it.
+            if not getattr(forward_step, "_vh_gate_logged", False):
+                forward_step._vh_gate_logged = True
+                logger.info(
+                    "[vh-diag] chunked-output gate: use_chunked=%s role=%r "
+                    "log_probs_chunk_size=%s is_last_stage=%s loss_type=%r",
+                    use_chunked_output,
+                    getattr(model, "role", "<unset>"),
+                    getattr(args, "log_probs_chunk_size", -1),
+                    mpu.is_pipeline_last_stage(),
+                    getattr(args, "loss_type", None),
+                )
 
             if use_chunked_output:
                 unwrapped = model
