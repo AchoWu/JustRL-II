@@ -655,24 +655,22 @@ def train_one_step(
                     break
 
         if _vh_diag:
-            # 头是否真的在优化器的参数集合里。grad=0 的另一个候选解释是这个 param
-            # 根本没被 get_megatron_optimizer 收进任何 param_group（那样 main_grad
-            # 也不会被 finalize_model_grads 填），此时 step() 当然不会动它。
+            # 头是否真的被优化器管着。注意不能用 id() 去比对 optimizer.param_groups：
+            # 分布式优化器的 param_groups 里装的是 fp32 **master** 副本，不是模型的
+            # bf16 参数，id 永远不相等 —— 早先那版检查因此恒报 0，是假阴性。
+            # 用 checkpoint.py 里已有的 model->main 映射来判断（它遍历
+            # model_float16_groups / shard_fp32_from_float16_groups 配对）。
             try:
-                _ids = set()
-                for _chunk in model:
-                    for _n, _p in _chunk.named_parameters():
-                        if _n.endswith("output_layer.weight"):
-                            _ids.add(id(_p))
-                _in_opt = sum(
-                    1
-                    for _grp in (optimizer.param_groups or [])
-                    for _p in _grp.get("params", [])
-                    if id(_p) in _ids
+                from .checkpoint import _value_head_main_param_absmax
+
+                _m = _value_head_main_param_absmax(optimizer, model)
+                logger.info(
+                    "[vh-diag] rollout=%s head main-param absmax=%s (None=映射解析失败)",
+                    rollout_id,
+                    "None" if _m is None else f"{_m:.6g}",
                 )
-                logger.info("[vh-diag] rollout=%s head-in-optimizer=%s", rollout_id, _in_opt)
             except Exception as _e:
-                logger.info("[vh-diag] rollout=%s head-in-optimizer check failed: %s", rollout_id, _e)
+                logger.info("[vh-diag] rollout=%s main-param check failed: %s", rollout_id, _e)
 
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()

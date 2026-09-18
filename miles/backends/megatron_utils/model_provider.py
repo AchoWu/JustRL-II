@@ -77,6 +77,25 @@ class LinearForLastLayer(torch.nn.Linear):
         weight: torch.Tensor | None = None,
         runtime_gather_output: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
+        # Value-head diagnostic. The critic's weight gradient is exactly zero while
+        # its bias gradient is not, and dV/dw = input_ while dV/db = 1, so the
+        # hidden states arriving here are the remaining suspect (reproduced offline:
+        # zero input gives exactly this signature). Log the input's magnitude once
+        # per process; a zero here explains a value head that never trains.
+        if self.out_features == 1 and not getattr(LinearForLastLayer, "_vh_input_logged", False):
+            LinearForLastLayer._vh_input_logged = True
+            _t = input_.detach()
+            logger.info(
+                "[vh-diag] output_layer input: shape=%s dtype=%s absmax=%.6g "
+                "nonzero=%d/%d requires_grad=%s sequence_parallel=%s",
+                tuple(_t.shape),
+                _t.dtype,
+                float(_t.abs().max()),
+                int((_t != 0).sum()),
+                _t.numel(),
+                input_.requires_grad,
+                self.sequence_parallel,
+            )
         logits = super().forward(input_)
         logits = logits.float()
         if self.sequence_parallel:
