@@ -149,6 +149,50 @@ def _value_head_main_param_absmax(optimizer, ddp_model):
     return max(found) if found else None
 
 
+def _log_transformer_weights_after_load(ddp_model, args) -> None:
+    """Diagnostic: are the transformer weights actually populated after the load?
+
+    The critic's decoder emits an all-zero ``[T, 1, H]`` tensor, yet the checkpoint
+    on disk is healthy -- every one of its nine weight tensors is fully non-zero
+    with a sane std (qkv 0.027, fc1 0.027, embedding 0.024), and all 42 layers are
+    present (megatron packs them into one key per module with the layer as a shard
+    dimension, e.g. ``decoder.layers.self_attention.linear_qkv.weight`` of shape
+    ``(42, 2560, 2048)``).
+
+    So the question is whether those values reach the live model. The load reports
+    success and ``allow_shape_mismatch`` is in play on this path
+    (``make_tp_sharded_tensor_for_checkpoint received extra kwargs``), and megatron's
+    dist-ckpt reader fills the overlapping region instead of raising when shapes
+    disagree -- the same mechanism that pollutes the critic's value head from the LM
+    head. A silent partial load would look exactly like this.
+
+    Sample one representative parameter per module type: an all-zero attention or
+    MLP weight here means the load did not populate the model, whereas non-zero
+    weights move the search to the forward pass.
+    """
+    wanted = ("linear_qkv.weight", "linear_proj.weight", "linear_fc1.weight", "word_embeddings.weight")
+    seen: set[str] = set()
+    for chunk in ddp_model or []:
+        for name, p in chunk.named_parameters():
+            key = next((w for w in wanted if name.endswith(w)), None)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            f = p.detach().float()
+            logger.info(
+                "[vh-diag] after-load param %s: shape=%s absmax=%.6g std=%.6g nonzero=%d/%d%s",
+                name,
+                tuple(p.shape),
+                float(f.abs().max()),
+                float(f.std()),
+                int((p.detach() != 0).sum()),
+                p.numel(),
+                "  <-- ALL ZERO" if float(f.abs().max()) == 0 else "",
+            )
+        if len(seen) == len(wanted):
+            break
+
+
 def _log_critic_value_head(ddp_model, args, tag, optimizer=None):
     """Diagnostic: the value head's magnitude around checkpoint load."""
     for name, p in _iter_scalar_value_head_params(ddp_model):
@@ -260,6 +304,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             load_path=load_path,
         )
     _log_critic_value_head(ddp_model, args, "after-load", optimizer)
+    _log_transformer_weights_after_load(ddp_model, args)
     _rezero_critic_value_head(ddp_model, optimizer, args)
     _log_critic_value_head(ddp_model, args, "after-rezero", optimizer)
 
