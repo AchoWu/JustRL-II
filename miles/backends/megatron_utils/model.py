@@ -607,8 +607,67 @@ def train_one_step(
     dumper_phase_util.finalize(model)
 
     if not disable_optimizer and valid_step:
+        # Value-head diagnostic. A 24-step critic run left output_layer.weight at
+        # exactly zero (all 2048 entries) with the bias still at its 0.52 init, i.e.
+        # V(s) was a constant and PPO's advantage degraded to plain reward. The
+        # aggregate grad_norm cannot show this: it is the whole-model norm, which a
+        # [1, H] head barely moves. Sample the head immediately around the step --
+        # before it, grads are still attached; after it, the weight has been updated
+        # -- so "no gradient reached the head" and "gradient reached it but the
+        # update was not written back" are distinguishable in one line.
+        #
+        # Under the distributed optimizer the gradient lives in main_grad (the
+        # bucketed fp32 buffer), not .grad, and .grad may legitimately be None.
+        _vh_diag = getattr(args, "loss_type", None) == "value_loss" and step_id == 0
+        _vh_before = None
+        if _vh_diag:
+            try:
+                _lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else float("nan")
+            except Exception:  # 诊断绝不能让训练崩
+                _lr = float("nan")
+            for _chunk in model:
+                for _n, _p in _chunk.named_parameters():
+                    if not _n.endswith("output_layer.weight"):
+                        continue
+                    _g = getattr(_p, "main_grad", None)
+                    if _g is None:
+                        _g = _p.grad
+                    _vh_before = float(_p.detach().abs().max())
+                    logger.info(
+                        "[vh-diag] rollout=%s pre-step %s shape=%s w_absmax=%.6g grad=%s lr=%.3g",
+                        rollout_id,
+                        _n,
+                        tuple(_p.shape),
+                        _vh_before,
+                        "None" if _g is None else f"{float(_g.detach().abs().max()):.6g}",
+                        _lr,
+                    )
+                    break
+                if _vh_before is not None:
+                    break
+
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+        if _vh_diag:
+            for _chunk in model:
+                _done = False
+                for _n, _p in _chunk.named_parameters():
+                    if not _n.endswith("output_layer.weight"):
+                        continue
+                    _after = float(_p.detach().abs().max())
+                    logger.info(
+                        "[vh-diag] rollout=%s post-step %s w_absmax=%.6g delta=%.3g update_successful=%s",
+                        rollout_id,
+                        _n,
+                        _after,
+                        _after - (_vh_before or 0.0),
+                        update_successful,
+                    )
+                    _done = True
+                    break
+                if _done:
+                    break
 
         # Update learning rate.
         assert update_successful
