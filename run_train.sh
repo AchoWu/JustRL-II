@@ -1,10 +1,14 @@
 #!/bin/bash
 # JustRL2 正式训练 —— 1 节点 8 GPU / 32k / 500 步
 #
-#   bash run_train.sh                 # 首次启动，或中断后原地续跑（默认 32k）
+#   bash run_train.sh                 # 首次启动，或中断后原地续跑（默认 16k）
+#   bash run_train.sh --32k           # 32k（原配方的 1 节点版本；本机 KV cache 会抖动）
 #   bash run_train.sh --16k           # 16k 变体（KV cache 装得下，但不是配方复现）
 #   bash run_train.sh --probe         # 只跑 3 步实测速度和显存（独立 EXP_TAG，不污染正式 run）
 #   bash run_train.sh --dry-run       # 只打印将要执行的命令和预检结果，不启动
+#
+# 权重默认会先拷到 /dev/shm/llms 再加载（tmpfs，消除网络存储的读盘开销）：
+#   SHM_WEIGHTS=0 关掉，SHM_DIR=<path> 换位置。首次拷贝约需一次加载的时间。
 #
 # 与 run_test.sh 的区别：那个是冒烟（3 步 / GBS 16 / 2k 响应），只验证管道能转；
 # 这个是真跑，全部参数取自 justrl2/configs/1node-8gpu-32k-baremetal.env 的默认值，
@@ -33,8 +37,8 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 # baremetal 配置里也设了一份，这里再设一次防止配置未同步。
 export SKIP_PIP_INSTALL=1
 
-# 显式的 CONFIG 环境变量优先于 --16k/--32k，两者都没给时用 32k（原配方的 1 节点版本）。
-CONFIG=${CONFIG:-${CONFIG_PICK:-justrl2/configs/1node-8gpu-32k-baremetal.env}}
+# 显式的 CONFIG 环境变量优先于 --16k/--32k，两者都没给时用 16k。
+CONFIG=${CONFIG:-${CONFIG_PICK:-justrl2/configs/1node-8gpu-16k-baremetal.env}}
 
 # colocate 模式下 miles 会强制开 sglang 的 memory saver（卸载 rollout 权重用），
 # 而 prefill 的 cuda graph backend 默认是 breakable，两者互斥：
@@ -73,6 +77,68 @@ FATAL=0
 note() { echo "  $1"; }
 fail() { echo "  !!   $1"; FATAL=1; }
 
+# 0) 权重放 tmpfs（/dev/shm）以加快加载。放在最前：它会改写 HF_MODEL_DIR /
+#    MEGATRON_MODEL_PATH，后面的检查和 train.sh 都要看到改写后的值。
+# models/ 在网络存储上，实测两处加载都很慢：
+#   SGLang 读 HF 权重     8m42s（8 个引擎并发读同一份，I/O 争抢）
+#   Megatron 读 dist ckpt 18m19s
+# tmpfs 是内存文件系统，消除这两处的读盘开销。首次 cp 仍要走一遍慢网络（约等于
+# 一次加载的时间），之后每次启动都省。
+#
+# SHM_WEIGHTS=0 关掉；SHM_DIR 换位置。
+# 注意 /dev/shm 占的是**内存**：上一轮 after_offload_train 已用 223GB 主机内存，
+# 加上权重十几 GB 没问题，但这部分不会自动释放，要手动 rm 或重启才回收。
+# Ray 的 plasma object store（RAY_OBJECT_STORE_MEMORY，默认 4GB）也住在 /dev/shm，
+# 所以容量检查要把它算进去。
+SHM_DIR=${SHM_DIR:-/dev/shm/llms}
+if [ "${SHM_WEIGHTS:-1}" = 1 ] && [ -d /dev/shm ]; then
+  # 源路径：优先已 export 的值，否则取配置里的默认（配置用 : ${VAR:=...}，这里
+  # 只读不写，用子 shell 隔离，避免污染当前环境）
+  _src_models=$(bash -c "source '$CONFIG' >/dev/null 2>&1; echo \$MODELS_DIR" 2>/dev/null)
+  _src_models=${MODELS_DIR:-${_src_models:-$PWD/models}}
+  _src_hf=$(bash -c "source '$CONFIG' >/dev/null 2>&1; echo \$HF_MODEL_DIR" 2>/dev/null)
+  _src_hf=${HF_MODEL_DIR:-${_src_hf:-$_src_models/JustRL-II-base-model}}
+  _src_mg=$(bash -c "source '$CONFIG' >/dev/null 2>&1; echo \$MEGATRON_MODEL_PATH" 2>/dev/null)
+  _src_mg=${MEGATRON_MODEL_PATH:-${_src_mg:-$_src_models/JustRL-II-base-model-torch_dist}}
+
+  if [ ! -d "$_src_hf" ] || [ ! -d "$_src_mg" ]; then
+    echo "  ??   tmpfs 加速跳过：源权重不存在（$_src_hf / $_src_mg）"
+  else
+    _need_mb=$(du -xsm "$_src_hf" "$_src_mg" 2>/dev/null | awk '{s+=$1} END {print s+0}' || echo 0)
+    # 已经在 tmpfs 里的部分不用重复计入
+    _have_mb=$(du -xsm "$SHM_DIR" 2>/dev/null | awk '{print $1+0}' || echo 0)
+    _free_mb=$(df -Pm /dev/shm 2>/dev/null | awk 'NR==2{print $4+0}')
+    # 给 Ray 的 plasma store 留出余量（默认 4GB），再加 2GB 缓冲
+    _reserve_mb=$(( (${RAY_OBJECT_STORE_MEMORY:-4000000000} / 1048576) + 2048 ))
+    if [ -z "$_free_mb" ]; then
+      echo "  ??   tmpfs 加速跳过：读不到 /dev/shm 容量"
+    elif [ $((_need_mb - _have_mb + _reserve_mb)) -gt "$_free_mb" ]; then
+      echo "  ??   tmpfs 加速跳过：/dev/shm 空闲 ${_free_mb}MB，需要 $((_need_mb - _have_mb))MB"
+      echo "       + Ray plasma 预留 ${_reserve_mb}MB。用 SHM_WEIGHTS=0 显式关闭可消除本提示。"
+    else
+      mkdir -p "$SHM_DIR"
+      for _pair in "$_src_hf" "$_src_mg"; do
+        _dst="$SHM_DIR/$(basename "$_pair")"
+        # 幂等：已存在且源没更新过就跳过。-u 只拷更新的文件，中断后重跑能续。
+        if [ -d "$_dst" ] && [ -z "$(find "$_pair" -newer "$_dst" -print -quit 2>/dev/null)" ]; then
+          echo "  OK   tmpfs 已有 $(basename "$_pair")（跳过拷贝）"
+        else
+          echo "  ..   拷到 tmpfs: $(basename "$_pair") -> $_dst（首次约需一次加载的时间）"
+          mkdir -p "$_dst"
+          cp -ru "$_pair"/. "$_dst"/ || { echo "  !!   拷贝失败，回退到原路径"; rm -rf "$_dst"; }
+        fi
+      done
+      # 只在两个目录都就位时才切换，避免一半在 tmpfs 一半在网络存储
+      if [ -d "$SHM_DIR/$(basename "$_src_hf")" ] && [ -d "$SHM_DIR/$(basename "$_src_mg")" ]; then
+        export HF_MODEL_DIR="$SHM_DIR/$(basename "$_src_hf")"
+        export MEGATRON_MODEL_PATH="$SHM_DIR/$(basename "$_src_mg")"
+        echo "  OK   权重走 tmpfs: $SHM_DIR"
+      fi
+    fi
+  fi
+fi
+
+
 # 1) cuDNN 必须只有一套。conda 装的那份（为了 cudnn.h）和 pip 的 9.22 同时在进程里
 #    时，SONAME 都是 libcudnn.so.9，先载入的赢符号解析、子库版本却对不上，TE 的
 #    FusedAttention 会在 critic 第一次前向报 CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
@@ -109,8 +175,9 @@ else
 fi
 
 # 3) 模型 / 数据存在。train.sh 也查，但它在 setup.sh 之后才查。
-for d in models datasets; do
-  [ -d "$d" ] || fail "$d/ 不存在（见 justrl2/prepare_model.sh / prepare_data.py）"
+#    查的是解析后的路径而不是写死 models/ —— tmpfs 加速会把它们指到 /dev/shm。
+for d in "${HF_MODEL_DIR:-models}" "${MEGATRON_MODEL_PATH:-models}" datasets; do
+  [ -d "$d" ] || fail "$d 不存在（见 justrl2/prepare_model.sh / prepare_data.py）"
 done
 
 # 4) 磁盘余量。SAVE_INTERVAL=25 + HF_SAVE_INTERVAL=25，500 步各 20 份；Megatron 的
