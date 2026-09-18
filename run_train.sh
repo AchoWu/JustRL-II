@@ -1,7 +1,8 @@
 #!/bin/bash
 # JustRL2 正式训练 —— 1 节点 8 GPU / 32k / 500 步
 #
-#   bash run_train.sh                 # 首次启动，或中断后原地续跑
+#   bash run_train.sh                 # 首次启动，或中断后原地续跑（默认 32k）
+#   bash run_train.sh --16k           # 16k 变体（KV cache 装得下，但不是配方复现）
 #   bash run_train.sh --probe         # 只跑 3 步实测速度和显存（独立 EXP_TAG，不污染正式 run）
 #   bash run_train.sh --dry-run       # 只打印将要执行的命令和预检结果，不启动
 #
@@ -20,6 +21,8 @@ for arg in "$@"; do
   case "$arg" in
     --probe)   MODE=probe ;;
     --dry-run) DRYRUN=1 ;;
+    --16k)     CONFIG_PICK=justrl2/configs/1node-8gpu-16k-baremetal.env ;;
+    --32k)     CONFIG_PICK=justrl2/configs/1node-8gpu-32k-baremetal.env ;;
     *)         ARGS+=("$arg") ;;
   esac
 done
@@ -30,7 +33,8 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 # baremetal 配置里也设了一份，这里再设一次防止配置未同步。
 export SKIP_PIP_INSTALL=1
 
-CONFIG=${CONFIG:-justrl2/configs/1node-8gpu-32k-baremetal.env}
+# 显式的 CONFIG 环境变量优先于 --16k/--32k，两者都没给时用 32k（原配方的 1 节点版本）。
+CONFIG=${CONFIG:-${CONFIG_PICK:-justrl2/configs/1node-8gpu-32k-baremetal.env}}
 
 # colocate 模式下 miles 会强制开 sglang 的 memory saver（卸载 rollout 权重用），
 # 而 prefill 的 cuda graph backend 默认是 breakable，两者互斥：
@@ -131,7 +135,11 @@ fi
 
 # 6) 续跑状态。半份 checkpoint 是硬错误，train.sh 会拒绝启动 —— 提前说清楚。
 SAVE_ROOT_GUESS=${SAVE_ROOT:-$PWD/runs}
-TAG_GUESS=${EXP_TAG:-justrl2_minicpm5_2b_math32k_1node_baremetal}
+# EXP_TAG 由配置文件决定（--16k / --32k 各有自己的），所以从配置里读出来而不是写死 ——
+# 否则 --16k 时会去查 32k 的目录，把「全新启动」误报成「续跑」。用子 shell 隔离，
+# 避免这些默认值污染当前环境（train.sh 自己会再 source 一次）。
+TAG_GUESS=${EXP_TAG:-$(bash -c "source '$CONFIG' >/dev/null 2>&1; echo \$EXP_TAG" 2>/dev/null)}
+TAG_GUESS=${TAG_GUESS:-justrl2_minicpm5_2b_math32k_1node_baremetal}
 A="$SAVE_ROOT_GUESS/$TAG_GUESS/latest_checkpointed_iteration.txt"
 C="$SAVE_ROOT_GUESS/${TAG_GUESS}_critic/latest_checkpointed_iteration.txt"
 if [ -f "$A" ] && [ -f "$C" ]; then
