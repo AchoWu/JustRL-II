@@ -87,28 +87,76 @@ class LinearForLastLayer(torch.nn.Linear):
         # tell us anything about the training forward -- which is the one whose
         # gradient we care about. grad_enabled distinguishes the two phases.
         if self.out_features == 1:
-            _n_logged = getattr(LinearForLastLayer, "_vh_input_logged", 0)
-            if _n_logged < 6:
-                LinearForLastLayer._vh_input_logged = _n_logged + 1
+            # 分相位计数：forward_only（no_grad）和训练 forward 各留配额，否则前者
+            # 会把额度用光 —— 实测 6 次全落在 no_grad 上，而我们要看的恰恰是训练那次。
+            _phase = "train" if torch.is_grad_enabled() else "fwdonly"
+            _counts = getattr(LinearForLastLayer, "_vh_input_counts", None)
+            if _counts is None:
+                _counts = {}
+                LinearForLastLayer._vh_input_counts = _counts
+            _n = _counts.get(_phase, 0)
+            if _n < 3:
+                _counts[_phase] = _n + 1
                 _t = input_.detach()
+                # 零输入已确认。现在要知道它是不是「整个张量恒零」还是只有部分位置零，
+                # 以及 std —— 若 absmax=0 但 std>0 是不可能的，可用来排除采样错误。
+                _f = _t.float()
                 logger.info(
-                    "[vh-diag] output_layer input #%d: shape=%s dtype=%s absmax=%.6g "
-                    "nonzero=%d/%d requires_grad=%s grad_enabled=%s sequence_parallel=%s",
-                    _n_logged,
+                    "[vh-diag] output_layer input [%s#%d]: shape=%s dtype=%s absmax=%.6g "
+                    "std=%.6g nonzero=%d/%d requires_grad=%s is_leaf=%s grad_fn=%s",
+                    _phase,
+                    _n,
                     tuple(_t.shape),
                     _t.dtype,
-                    float(_t.abs().max()),
+                    float(_f.abs().max()),
+                    float(_f.std()),
                     int((_t != 0).sum()),
                     _t.numel(),
                     input_.requires_grad,
-                    torch.is_grad_enabled(),
-                    self.sequence_parallel,
+                    input_.is_leaf,
+                    type(input_.grad_fn).__name__ if input_.grad_fn is not None else "None",
                 )
         logits = super().forward(input_)
         logits = logits.float()
         if self.sequence_parallel:
             logits = tensor_parallel.gather_from_sequence_parallel_region(logits, tensor_parallel_output_grad=False)
         return logits, None
+
+
+def _attach_vh_decoder_probe(model) -> None:
+    """Value-head diagnostic: report the transformer block's output magnitude.
+
+    The critic's head receives an all-zero ``[T, 1, H]`` tensor, so ``dV/dw =
+    input_ = 0`` and the weight never trains while the bias (``dV/db = 1``) does
+    pick up a gradient. The chunked-logits bypass is ruled out (role resolves to
+    "critic", use_chunked=False), so the zeros arrive from upstream. Hooking the
+    decoder separates "the model itself produces zeros" from "something zeroes
+    them between the block and the head".
+    """
+
+    def _probe(_mod, _args_in, _out):
+        _c = getattr(_probe, "_n", 0)
+        if _c >= 4:
+            return
+        _probe._n = _c + 1
+        _t = _out[0] if isinstance(_out, tuple) else _out
+        if not torch.is_tensor(_t):
+            return
+        _f = _t.detach().float()
+        logger.info(
+            "[vh-diag] decoder out [%s#%d]: shape=%s absmax=%.6g std=%.6g nonzero=%d/%d",
+            "train" if torch.is_grad_enabled() else "fwdonly",
+            _c,
+            tuple(_t.shape),
+            float(_f.abs().max()),
+            float(_f.std()),
+            int((_t.detach() != 0).sum()),
+            _t.numel(),
+        )
+
+    decoder = getattr(model, "decoder", None)
+    if decoder is not None:
+        decoder.register_forward_hook(_probe)
 
 
 def get_model_provider_func(
@@ -141,6 +189,7 @@ def get_model_provider_func(
                     config=model.config,
                     bias_init=getattr(args, "critic_value_bias_init", 0.0),
                 )
+                _attach_vh_decoder_probe(model)
             return model
 
         return wrapped_model_provider
@@ -327,6 +376,7 @@ def get_model_provider_func(
                 config=config,
                 bias_init=getattr(args, "critic_value_bias_init", 0.0),
             )
+            _attach_vh_decoder_probe(model)
 
         return model
 
