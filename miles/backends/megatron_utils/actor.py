@@ -123,8 +123,15 @@ class MegatronTrainRayActor(TrainRayActor):
             # never trains while the bias gradient (dV/db = 1) stays alive -- the
             # asymmetry that made this look like an optimizer bug for three days.
             #
-            # Megatron asserts the grad and param flags agree unless nccl_ub is on
-            # (param_and_grad_buffer.py:1237), so both have to move together.
+            # Both flags move together. Megatron only *requires* that when the param
+            # and grad buffers share one allocation, which needs MXFP8 tensors and so
+            # does not apply here (param_and_grad_buffer.py:1237, fp8=None on this
+            # stack) — but the grad buffer has exactly the same problem, and setting
+            # both keeps the pair trivially consistent if that path is ever taken.
+            #
+            # get_megatron_ddp_config copies every DistributedDataParallelConfig field
+            # off args by name (training.py:2393), and this runs before
+            # initialize_model_and_optimizer, so the override does reach the buffers.
             if self.args.offload_train and self.args.disable_param_buffers_cpu_backup:
                 logger.info(
                     "[critic] re-enabling param/grad buffer CPU backup: the critic has no "
