@@ -203,11 +203,48 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return start_rollout_id
 
+    def _vh_probe_weights(self, tag: str) -> None:
+        """Value-head diagnostic: are the weights still there around sleep/wake?
+
+        Everything measured so far says the checkpoint loads correctly and then the
+        forward emits zeros from the very first op (embedding-out absmax=0), with the
+        live GPU weights verified good immediately after the load. The bias tells the
+        same story twice over: 0.519531 at after-rezero, then absmax=0 by the time
+        training reads it.
+
+        The suspect is this class's own sleep/wake cycle. torch_memory_saver.pause()
+        releases the managed GPU memory and resume() re-allocates it; the actor's
+        contents survive because TensorBackuper holds a CPU copy, but the critic
+        returns from init() before that backuper is ever constructed
+        (actor.py: `if role == "critic": ... return`), and it sleeps immediately after
+        loading. If resume() hands back fresh, zeroed memory, every observation above
+        follows.
+        """
+        try:
+            for chunk in self.model or []:
+                for name, p in chunk.named_parameters():
+                    if name.endswith("embedding.word_embeddings.weight") or name.endswith("output_layer.bias"):
+                        f = p.detach().float()
+                        logger.info(
+                            "[vh-diag] %s %s: absmax=%.6g std=%.6g nonzero=%d/%d%s",
+                            tag,
+                            name.rsplit(".", 2)[-2] + "." + name.rsplit(".", 1)[-1],
+                            float(f.abs().max()),
+                            float(f.std()) if p.numel() > 1 else 0.0,
+                            int((p.detach() != 0).sum()),
+                            p.numel(),
+                            "  <-- ALL ZERO" if float(f.abs().max()) == 0 else "",
+                        )
+                break
+        except Exception as e:  # 诊断绝不能让训练崩
+            logger.info("[vh-diag] %s probe failed: %s", tag, e)
+
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
 
         clear_memory(clear_host_memory=True)
+        self._vh_probe_weights(f"{self.role} before-pause")
         print_memory_extended("sleep: before torch_memory_saver.pause", reset_peak=True)
         destroy_process_groups()
 
@@ -231,6 +268,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         reload_process_groups()
+        self._vh_probe_weights(f"{self.role} after-resume")
         print_memory_extended("wake_up: after torch_memory_saver.resume (train model on GPU)")
 
     def _switch_model(self, target_tag: str) -> None:

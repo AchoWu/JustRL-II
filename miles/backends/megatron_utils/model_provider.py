@@ -186,26 +186,33 @@ def _attach_vh_input_probe(model, role: str) -> None:
             _c = getattr(_emb_pre, "_n", 0)
             if _c >= 2:
                 return
-            _emb_pre._n = _c + 1
-            for _i, _x in enumerate(_a or ()):
-                if torch.is_tensor(_x):
-                    _d = _x.detach()
-                    logger.info(
-                        "[vh-diag] %s/embedding-IN arg%d [%s#%d]: shape=%s dtype=%s "
-                        "min=%s max=%s nonzero=%d/%d",
-                        role,
-                        _i,
-                        "train" if torch.is_grad_enabled() else "fwdonly",
-                        _c,
-                        tuple(_d.shape),
-                        _d.dtype,
-                        _d.min().item() if _d.numel() else "n/a",
-                        _d.max().item() if _d.numel() else "n/a",
-                        int((_d != 0).sum()),
-                        _d.numel(),
-                    )
+            # megatron calls the embedding with keyword arguments, so the previous
+            # positional-only version of this hook never fired. Scan both.
+            _items = list(enumerate(_a or ())) + list((_kw or {}).items())
+            _found = False
+            for _i, _x in _items:
+                if not torch.is_tensor(_x):
+                    continue
+                _found = True
+                _d = _x.detach()
+                logger.info(
+                    "[vh-diag] %s/embedding-IN %s [%s#%d]: shape=%s dtype=%s "
+                    "min=%s max=%s nonzero=%d/%d",
+                    role,
+                    _i if isinstance(_i, str) else f"arg{_i}",
+                    "train" if torch.is_grad_enabled() else "fwdonly",
+                    _c,
+                    tuple(_d.shape),
+                    _d.dtype,
+                    _d.min().item() if _d.numel() else "n/a",
+                    _d.max().item() if _d.numel() else "n/a",
+                    int((_d != 0).sum()),
+                    _d.numel(),
+                )
+            if _found:
+                _emb_pre._n = _c + 1
 
-        emb.register_forward_pre_hook(_emb_pre)
+        emb.register_forward_pre_hook(_emb_pre, with_kwargs=True)
         we = getattr(emb, "word_embeddings", None)
         if we is not None:
             we.register_forward_hook(_make("word_embeddings-out"))
