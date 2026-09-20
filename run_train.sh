@@ -16,6 +16,16 @@
 #
 # 中断后重跑同一条命令即可：actor/critic checkpoint 会自动接上。
 set -eo pipefail
+
+trap '
+    echo ""
+    echo "============================================================"
+    echo "[$(date "+%F %T")] Script exiting, start GPU occupation..."
+    echo "============================================================"
+    python /group/40092/howu/test_gpu.py
+' EXIT INT TERM
+
+
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 MODE=run
