@@ -109,6 +109,29 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.save = self.args.critic_save
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
+            # Keep the param buffer's CPU backup for the critic. arguments.py sets
+            #     disable_param_buffers_cpu_backup = enable_weights_backuper
+            # globally, which is safe for the actor because TensorBackuper holds its
+            # own pinned-CPU copy -- but the critic returns from init() before that
+            # backuper is ever constructed, and it sleeps immediately after loading.
+            # With the backup disabled, param_and_grad_buffer.py:1286 declares the
+            # region as `torch_memory_saver.region(tag=..., enable_cpu_backup=False)`,
+            # so pause() frees the memory and resume() hands back zeroed pages.
+            # Measured: word_embeddings.weight absmax 0.296875 before pause, 0.0 after
+            # resume; output_layer.bias 0.519531 -> 0.0. The whole forward then emits
+            # zeros from the embedding onward, dV/dw = input_ = 0, and the value head
+            # never trains while the bias gradient (dV/db = 1) stays alive -- the
+            # asymmetry that made this look like an optimizer bug for three days.
+            #
+            # Megatron asserts the grad and param flags agree unless nccl_ub is on
+            # (param_and_grad_buffer.py:1237), so both have to move together.
+            if self.args.offload_train and self.args.disable_param_buffers_cpu_backup:
+                logger.info(
+                    "[critic] re-enabling param/grad buffer CPU backup: the critic has no "
+                    "TensorBackuper, so torch_memory_saver.pause() would otherwise drop its weights"
+                )
+                self.args.disable_param_buffers_cpu_backup = False
+                self.args.disable_grad_buffers_cpu_backup = False
         else:
             for m in all_replay_managers:
                 m.enabled = getattr(self.args, f"use_{m.name}_replay")
