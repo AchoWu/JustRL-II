@@ -176,6 +176,40 @@ def _attach_vh_input_probe(model, role: str) -> None:
     if emb is not None:
         emb.register_forward_hook(_make("embedding-out"))
 
+        # embedding-out is zero while word_embeddings.weight is demonstrably fine on
+        # the GPU (std 0.0242, matching the checkpoint), so the remaining candidates
+        # are the input ids and the embedding's own tail. A pre-hook shows what it
+        # was actually asked to look up: all-zero or empty input_ids would explain
+        # everything downstream, and that points at data plumbing rather than the
+        # model. Log the ids and the raw word-embedding lookup separately.
+        def _emb_pre(_mod, _a, _kw=None):
+            _c = getattr(_emb_pre, "_n", 0)
+            if _c >= 2:
+                return
+            _emb_pre._n = _c + 1
+            for _i, _x in enumerate(_a or ()):
+                if torch.is_tensor(_x):
+                    _d = _x.detach()
+                    logger.info(
+                        "[vh-diag] %s/embedding-IN arg%d [%s#%d]: shape=%s dtype=%s "
+                        "min=%s max=%s nonzero=%d/%d",
+                        role,
+                        _i,
+                        "train" if torch.is_grad_enabled() else "fwdonly",
+                        _c,
+                        tuple(_d.shape),
+                        _d.dtype,
+                        _d.min().item() if _d.numel() else "n/a",
+                        _d.max().item() if _d.numel() else "n/a",
+                        int((_d != 0).sum()),
+                        _d.numel(),
+                    )
+
+        emb.register_forward_pre_hook(_emb_pre)
+        we = getattr(emb, "word_embeddings", None)
+        if we is not None:
+            we.register_forward_hook(_make("word_embeddings-out"))
+
 
 def get_model_provider_func(
     args: argparse.Namespace,
