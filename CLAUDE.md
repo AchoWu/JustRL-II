@@ -137,92 +137,93 @@ to `max_position_embeddings`, `sglang-context-length` and `sglang-max-prefill-to
 - **`ReloadableProcessGroup` must never return `None` from a collective.** Since torch 2.8 `ProcessGroupNCCL::collectiveCoalesced` ends `return asyncOp ? work : nullptr`, so a *synchronous* coalesced collective hands back `nullptr` → Python `None`. `PyProcessGroup`'s `WORK_OVERRIDE` macro does not check: it feeds that into `make_intrusive<PyWorkHolder>(o)`, and because `Work`'s holder is `PYBIND11_DECLARE_HOLDER_TYPE(..., true)`, `None` casts to an *empty* `intrusive_ptr` instead of being rejected. `PyWorkHolder::wait` then does `work_->wait(timeout)` with no null check → SIGSEGV on every rank at once, at the critic's first gradient reduction. `_fwd` in `miles/utils/reloadable_process_group.py` returns a synthetic `_CompletedWork` instead (`None` means the collective already finished synchronously, so `wait() == True` is correct). **Upgrading torch does not fix this**: the `o.is_none()` guard from pytorch#189817 is absent in 2.13 and present in 2.14, but `reduce_scatter_tensor_coalesced` is one of the sites that bypass `WORK_OVERRIDE` with a hand-written dual-name lookup, still unguarded in 2.14. Nor is 2.13 ahead of upstream — miles pins it transitively via `lmsysorg/sglang:v0.5.19`. Also resolve the `reduce_scatter_tensor` → `reduce_scatter_single` rename: `PyProcessGroup` looks up the `*_single*` spelling first, so both are defined and dispatched against whichever the inner PG implements.
 - **Two co-loaded cuDNN copies segfault TE's FusedAttention.** `conda install -c nvidia cudnn` (needed for `cudnn.h` when building TE's torch extension) also drops a full runtime into `$CONDA_PREFIX/lib`. Both it and pip's copy carry SONAME `libcudnn.so.9`; whichever loads first with RTLD_GLOBAL wins symbol resolution, then dlopens its own sub-libraries by SONAME and gets the other version → `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` at the critic's first forward, 70 minutes into startup. Move the runtime libs **outside** `$CONDA_PREFIX`, keeping the header: a subdirectory of `lib/` is *not* enough (verified — `lib/_shadowed/` created 2609-09-15 was still mapped by the 09-16 run). This is separate from the ldconfig-cache copy handled in `bare_metal_cu129.sh`; both need plugging. `verify_env.py`'s "cuDNN 单一来源" check reads `/proc/self/maps` and is the only one of the four cuDNN checks that catches this — version, `CDLL`, and ldconfig all pass on a broken machine.
 - **KV cache is over-subscribed at 32k on one node.** The pool is `SGLANG_MAX_TOTAL_TOKENS` *per engine* and each concurrent request reserves its full context: `32 x 30720 = 983k` against a 524k pool, 1.9x over. Early steps fit because samples are short; once response length grows (what RL does early on) SGLang starts logging `KV cache pool is full. Retract requests.` and thrashes — a retract discards generated KV and re-prefills, so the work is lost and rollout wedges (observed: 50 minutes at 0/64 samples). Concurrency must come down with the length; halving the length alone lands on `32 x 16384 = 524288`, exactly at the limit.
+- **The critic must keep its param/grad buffer CPU backup.** `arguments.py` sets `disable_param_buffers_cpu_backup = enable_weights_backuper` globally, in `miles_validate_args`, which runs before a process knows whether it is the actor or the critic. That is safe for the actor — `TensorBackuper` holds a pinned-CPU copy — but the critic returns from `init()` before that backuper exists and sleeps right after loading, so with the backup off `torch_memory_saver.pause()` frees its weights and `resume()` returns zeroed pages. `actor.py` re-enables both flags for the critic before `initialize_model_and_optimizer`. Do not "simplify" that back to the global setting; see the resolved-bug section below for what it costs.
 
 
-## OPEN BUG: the critic's value head never trains (bare-metal cu129 / H20)
+## Resolved: the critic's value head never trained (bare-metal cu129 / H20)
 
-**Status: unresolved. Do not start a long run until this is closed** — the recipe's
-three core knobs all exist to shape a working critic, so with a dead one the whole
-thing degenerates to something GRPO-ish.
+Closed 2026-09-20. Kept because the symptom is silent, the false leads were
+expensive, and the same shape of bug can come back the moment a role-specific
+gap meets a global setting.
 
-Symptom, straight out of a checkpoint after 24 steps of training:
+**Symptom.** After 24 steps the critic's head was untouched — `output_layer.weight`
+`nonzero=0/2048`, bias still at its `0.52` init — so `V(s)` was constant and PPO's
+advantage collapsed to plain reward. Nothing in the logs said so.
 
-```
-output_layer.weight: absmax=0 mean=0 nonzero=0/2048     <- never moved
-output_layer.bias:   0.51953125                         <- still the 0.52 init
-```
+**Cause.** `miles_validate_args` runs before a process knows its role and sets
 
-`V(s)` is therefore a constant and PPO's advantage collapses to plain reward.
-
-The causal chain, each link measured (`[vh-diag]` logging in `model.py`,
-`model_provider.py`, `checkpoint.py`):
-
-```
-hidden states entering output_layer are all zero  (absmax=0, nonzero=0/30146560)
-  -> dV/dw = input_ = 0, so weight.main_grad == 0
-  -> dV/db = 1 regardless, so bias.main_grad == 0.484  (this asymmetry is the tell)
-  -> weight never moves; V(s) == bias for every state
+```python
+if args.offload_train:
+    args.disable_grad_buffers_cpu_backup = True
+    args.disable_param_buffers_cpu_backup = args.enable_weights_backuper   # True
 ```
 
-The decoder's own output is already zero, while its graph is intact
-(`requires_grad=True`, `grad_fn=MakeViewlessTensorBackward`) — so this is a real
-zero, not a severed backward path.
+With that, `param_and_grad_buffer.py:1286` declares the buffer's region as
+`torch_memory_saver.region(tag=..., enable_cpu_backup=False)`, so `pause()` frees the
+memory and `resume()` returns zeroed pages. The actor survives because its
+`TensorBackuper` holds a pinned-CPU copy; the critic returns from `init()` *before*
+that backuper is built and sleeps immediately after loading, so it had neither.
+Measured across the cycle: `word_embeddings.weight` absmax `0.296875 -> 0`,
+`output_layer.bias` `0.519531 -> 0`. The forward then emits zeros from the embedding
+onward, and since `dV/dw = input_ = 0` the weight gets no gradient while the bias
+(`dV/db = 1`) still does — that asymmetry is what made it look like an optimizer bug.
 
-### Ruled out (all measured, not argued)
+**Fix.** `actor.py` re-enables both flags for the critic, in the block where it
+already overrides load/save/lr and before `initialize_model_and_optimizer` builds the
+buffers. `get_megatron_ddp_config` copies every `DistributedDataParallelConfig` field
+off `args` by name (`training.py:2393`), so the override reaches the buffers.
 
-| Hypothesis | How it died |
-| --- | --- |
-| Checkpoint is corrupt / missing layers | All 9 weight tensors fully non-zero, sane std (qkv 0.027, fc1 0.027, emb 0.024). 42 layers present — megatron packs them one key per module with the layer as a shard dim, so `decoder.layers.self_attention.linear_qkv.weight` is a single `(42, 2560, 2048)` entry. 180 keys is normal for that packing; `layers.0.*` matches nothing by design |
-| tmpfs staging broke the copy | `/dev/shm` copy byte-identical to source: same size, file count, key count, values |
-| `MEGATRON_MODEL_PATH` at the wrong level | Layout is correct (`latest_checkpointed_iteration.txt` + `release/`), parent dir as required |
-| `allow_shape_mismatch` causing a silent partial load | `Megatron-LM/megatron/core/utils.py:997` only `logger.warning`s the leftover kwargs and forwards them verbatim. Noise, not a load change |
-| FP8/FP4 quantization path | `fp8=None`, `fp4=None`; miles-main's NVFP4 QAT is not involved |
-| Chunked-logits bypass skipping `output_layer` | Gate logs `use_chunked=False role='critic'` — `post_process` stays on |
-| Sequence-parallel gather severing the gradient | `sequence_parallel=False` on this path |
-| `value_loss_function`'s `torch.max(surr1, surr2)` | At step 0 `values == old_values` so `surr1 == surr2`; reproduced offline and `w.grad` is 1.045, not 0 |
-| Warmup pinning lr at 0 | `lr_warmup_steps = 10*64 = 640` vs `lr_decay_steps = 500*64 = 32000`. And at rollout 1 `lr=5e-07` while grad is still 0 |
-| `is_embedding_or_output_parameter` skewing param groups | Both megatron uses are gated on `decoupled_lr_enabled`; `decoupled_lr` is None |
+**Verified.** `after-resume` now matches `before-pause` over a dozen sleep/wake
+cycles, the head's `main_grad` is 5–49 instead of exactly 0, and its weight leaves
+zero by rollout 2 (`absmax=4.99e-07`).
 
-### Three readings that look like evidence and are not
+### Readings that look like evidence and are not
 
-Each of these cost a round of investigation:
+Each of these cost a round of investigation; they will mislead again.
 
-- **`critic-grad_norm` (0.79–0.89) does not mean the head has gradients.** It is
-  `optimizer.get_grad_norm()`, a whole-model norm; a 2048-element head barely
-  moves it. Note `value_loss=0.3962` against `grad_norm=0.7924` is exactly the
-  factor of 2 that `d/dV (V-R)^2 = 2(V-R)` gives, so a gradient *w.r.t. V* does
-  exist — it just never reaches the weight.
+- **`critic-grad_norm` (0.79–0.89) says nothing about the head.** It is
+  `optimizer.get_grad_norm()`, a whole-model norm that 2048 elements barely move.
+  `value_loss=0.3962` against `grad_norm=0.7924` is exactly the factor of 2 from
+  `d/dV (V-R)^2 = 2(V-R)` — a gradient w.r.t. `V` existed the whole time; it just
+  never reached the weight.
 - **`main_absmax` in the `[critic-value-head]` lines is weight-OR-bias.**
-  `_value_head_main_param_absmax` takes the max over both, so the familiar
-  `0.5196` is the *bias*, and says nothing about the weight.
-- **Comparing `id()` against `optimizer.param_groups` always reports 0.** The
-  distributed optimizer stores fp32 *master* copies there, never the model's bf16
-  params. A "head not in optimizer" reading from that is a false negative.
+  `_value_head_main_param_absmax` maxes over both, so the familiar `0.5196` is the
+  *bias*.
+- **`id()` against `optimizer.param_groups` always reports 0.** The distributed
+  optimizer stores fp32 *master* copies there, never the model's bf16 params.
+- **Coherent rollout text proves nothing about the megatron forward** — it comes from
+  SGLang, which loads its own copy of the weights.
+- **A "successfully loaded checkpoint" line proves nothing either.** The checkpoint,
+  the tmpfs copy and the post-load model state were all verified good while the
+  forward still emitted zeros.
 
-Also: coherent rollout samples prove nothing about the megatron-side forward —
-rollout text comes from SGLang, which loads its own copy of the weights.
+Also worth knowing for the next dist-ckpt inspection: megatron packs all layers into
+one key per module with the layer as a shard dimension, so
+`decoder.layers.self_attention.linear_qkv.weight` is a single `(42, 2560, 2048)`
+entry and `layers.0.*` matches nothing. 180 keys is normal, not evidence of loss.
 
-### Where it stands
+### Diagnostics left in the tree
 
-Zeros originate inside the forward. `_attach_vh_input_probe` samples four points in
-order — `embedding-out`, `layer0-out`, `final_layernorm`, `decoder-out` — for
-**both** roles, so the first zero localizes the origin, and the actor/critic
-comparison shows whether this is critic-specific or global. If the actor is also
-zero its `log_probs` are degenerate too, which silently breaks TIS and the KL term.
+`[vh-diag]` logging in `model.py`, `model_provider.py`, `checkpoint.py` and
+`actor.py`: weight/bias gradient around `optimizer.step()`, a four-point forward
+probe (`embedding-out`, `layer0-out`, `final_layernorm`, `decoder-out`) on both
+roles, the embedding's input ids, post-load parameter magnitudes, and the
+before-pause/after-resume pair. All gated to the critic's first step per rollout or
+a small per-phase budget. Cheap enough to keep; they are the fastest way to re-check
+that the head still trains.
 
 ```bash
-grep "vh-diag" nohup.out | sed 's/\x1b\[[0-9;]*m//g' | grep -oE "(critic|actor)/[a-z0-9_-]+ \[.*"
+grep "vh-diag" nohup.out | sed 's/\[[0-9;]*m//g' | grep -oE "(before-pause|after-resume|pre-step output_layer).*"
 ```
 
-Untested suspect if all four come back non-zero: `--recompute-granularity full`,
-the one remaining setting that changes forward behaviour and has not been varied.
 
 ## Startup checks worth grepping for
 
 - `[critic-value-head] ... after-load ... w_absmax=0.189` then `re-zeroed [...] (bias_init=0.52, master params resynced)` — post-load re-init ran.
 - First rollout sample responses are coherent text (not garbage — that indicates `MEGATRON_MODEL_PATH` pointed at an `iter_xxx` subdir).
 - `critic exclude shaping: critic returns computed from rewards without overlong penalty`.
-- `[vh-diag] ... decoder-out ...` with a non-zero `absmax` — see the open bug above.
+- `[critic] re-enabling param/grad buffer CPU backup ...` on every critic rank — without it the head silently never trains.
+- `[vh-diag] ... after-resume ...` matching its `before-pause` line, and `pre-step output_layer.weight ... main_grad=` well above zero.
 
 
 ## DSpark speculative decoding
