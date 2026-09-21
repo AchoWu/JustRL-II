@@ -125,6 +125,8 @@ def main() -> None:
         print(f"pip install -c {cons} {' '.join(sorted(all_missing))}")
         print("\n--- 装完必查（torch 带 +cu129 / numpy 1.x / flash-attn 那行必须为空）---")
         print("pip list 2>/dev/null | grep -iE '^(torch|numpy|sglang-kernel|flash-attn) '")
+        print("warning: should pip nvidia-cudnn-cu12==9.22.0.52")
+        print('pip install --force-reinstall --no-deps "nvidia-cudnn-cu12==9.22.0.52"')
 
 
 if __name__ == "__main__":
