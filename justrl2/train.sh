@@ -14,6 +14,16 @@
 # are picked up automatically (both must exist; a half-present pair is a hard error).
 
 set -eo pipefail
+
+trap '
+    echo ""
+    echo "============================================================"
+    echo "[$(date "+%F %T")] Script exiting, start GPU occupation..."
+    echo "============================================================"
+    python /group/40092/howu/JustRL-II/test_gpu.py
+' EXIT INT TERM
+
+
 CONFIG=${1:?usage: bash justrl2/train.sh <config.env> [extra miles args]}
 shift
 source "$CONFIG"
