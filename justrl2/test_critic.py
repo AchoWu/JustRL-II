@@ -360,29 +360,31 @@ def spearman(xs: list[float], ys: list[float]) -> float | None:
 
 
 def _report_per_prompt(records: list[dict]) -> None:
-    """Group by V(s_0) to recover per-prompt behaviour.
+    """Per-prompt behaviour, plus the within-prompt AUCs that control for difficulty.
 
-    V(s_0) is a function of the prompt alone, so every sample of the same prompt shares
-    it exactly — which means it doubles as a prompt id here, and the number of distinct
-    values is the real sample size for any claim about V(s_0). With 8 samples per
-    prompt a 64-row table is 8 prompts, and a sample-level AUC on V(s_0) is dominated
-    by which prompts happened to be easy, not by whether V ranks them.
+    V(s_0) depends on the prompt alone, so the number of distinct prompts — not the row
+    count — is the real sample size for any claim about it. Grouping is keyed on the
+    prompt text, NOT on V(s_0): bf16 rounding puts samples of one prompt on adjacent
+    ticks (0.439453 and 0.441406 are exactly 1 ulp apart at that magnitude), which
+    silently splits a group and inflates the prompt count.
+
+    The within-prompt AUCs are the ones that mean something. Difficulty varies far more
+    across prompts than response quality does within one, so a sample-level AUC largely
+    measures "were the easy prompts sampled more", and it shares that confound with
+    response length. Restricting to pairs from the same prompt removes both.
     """
-    groups: dict[float, list[dict]] = {}
+    groups: dict[str, list[dict]] = {}
     for r in records:
         if r["correct"] is not None:
-            groups.setdefault(round(r["v0"], 4), []).append(r)
+            groups.setdefault(r["prompt_key"], []).append(r)
     if len(groups) < 2:
         return
 
-    print(
-        f"\n  per-prompt (V(s_0) is a function of the prompt, so it groups them): "
-        f"{len(groups)} distinct prompts"
-    )
+    print(f"\n  per-prompt: {len(groups)} distinct prompts (V(s_0) depends on the prompt only)")
     print(f"    {'V(s_0)':>8} {'n':>3} {'acc':>6}")
     v0s, accs = [], []
-    for v0 in sorted(groups):
-        rows = groups[v0]
+    for _, rows in sorted(groups.items(), key=lambda kv: statistics.mean(r["v0"] for r in kv[1])):
+        v0 = statistics.mean(r["v0"] for r in rows)
         acc = sum(1 for r in rows if r["correct"]) / len(rows)
         v0s.append(v0)
         accs.append(acc)
@@ -392,8 +394,25 @@ def _report_per_prompt(records: list[dict]) -> None:
     if rho is not None:
         print(f"    Spearman(V(s_0), per-prompt acc) = {rho:+.3f} over {len(groups)} prompts")
         if abs(rho) < 0.3:
-            print("    -> V(s_0) does not rank prompt difficulty. The head's prompt-level")
-            print("       signal is noise; only the response-conditioned values carry any.")
+            print("    -> V(s_0) does not rank prompt difficulty; its prompt-level signal is noise.")
+
+    # Within-prompt: only compare a correct and an incorrect response to the SAME prompt.
+    print("\n  within-prompt AUC (same prompt only — controls for difficulty):")
+    for key, label in (("v_last", "V_last"), ("v_mean", "V_mean"), ("neg_len", "-length (baseline)")):
+        weighted = pairs = 0
+        for rows in groups.values():
+            pos = [r[key] for r in rows if r["correct"] is True]
+            neg = [r[key] for r in rows if r["correct"] is False]
+            a = auc(pos, neg)
+            if a is not None:
+                n_pairs = len(pos) * len(neg)
+                weighted += a * n_pairs
+                pairs += n_pairs
+        if pairs:
+            print(f"    {label:20s} AUC={weighted / pairs:.3f}   ({pairs} pairs)")
+    if pairs:
+        print("    V_last must beat the -length baseline here, or the head is adding nothing")
+        print("    that 'shorter answers are more often right' would not already give you.")
 
 
 def run_samples(args, state_dict, megatron_args) -> None:
@@ -433,10 +452,16 @@ def run_samples(args, state_dict, megatron_args) -> None:
         records.append(
             {
                 "idx": i,
+                # The prompt itself is the group key, not V(s_0): bf16 rounding scatters
+                # one prompt's V(s_0) across adjacent ticks and would split the group.
+                "prompt_key": prompt_text,
                 "v0": v0,
                 "v_mean": float(values.mean()),
                 "v_last": float(values[-1]),
                 "n_response": len(response_ids),
+                # Negated so "higher is better" holds for every feature the AUCs rank,
+                # i.e. shorter responses are more often correct.
+                "neg_len": -len(response_ids),
                 "correct": ok,
             }
         )
@@ -448,7 +473,9 @@ def run_samples(args, state_dict, megatron_args) -> None:
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             for r in records:
-                f.write(json.dumps(r) + "\n")
+                # prompt_key is the full templated prompt, used only for grouping in
+                # memory; writing it would bloat the file. idx already identifies the row.
+                f.write(json.dumps({k: v for k, v in r.items() if k != "prompt_key"}) + "\n")
         print(f"\nper-sample values -> {args.out}")
 
     print("\n" + "=" * 60)
@@ -475,8 +502,14 @@ def run_samples(args, state_dict, megatron_args) -> None:
         # "did the easy prompts happen to be sampled more" -- see the per-prompt table
         # below. V_last is the value after reading the whole response and is what PPO
         # actually differences against.
-        print("\n  AUC by feature (0.5 = no discrimination):")
-        for key, label in (("v0", "V(s_0)  prompt only"), ("v_mean", "V_mean"), ("v_last", "V_last  full response")):
+        print("\n  sample-level AUC (0.5 = no discrimination; CONFOUNDED by prompt difficulty —")
+        print("  see the within-prompt numbers below before concluding anything):")
+        for key, label in (
+            ("v0", "V(s_0)  prompt only"),
+            ("v_mean", "V_mean"),
+            ("v_last", "V_last  full response"),
+            ("neg_len", "-length (baseline)"),
+        ):
             pos = [r[key] for r in records if r["correct"] is True]
             neg = [r[key] for r in records if r["correct"] is False]
             a = auc(pos, neg)
@@ -485,13 +518,6 @@ def run_samples(args, state_dict, megatron_args) -> None:
                     f"    {label:22s} AUC={a:.4f}   mean|correct={statistics.mean(pos):.4f} "
                     f"mean|wrong={statistics.mean(neg):.4f}"
                 )
-        # Length as a baseline: if V_last cannot beat "shorter answers are right", the
-        # head is not adding anything a two-line heuristic would not give.
-        pos_len = [-r["n_response"] for r in records if r["correct"] is True]
-        neg_len = [-r["n_response"] for r in records if r["correct"] is False]
-        a_len = auc(pos_len, neg_len)
-        if a_len is not None:
-            print(f"    {'(baseline: -length)':22s} AUC={a_len:.4f}   <- V_last should beat this")
 
         _report_per_prompt(records)
 

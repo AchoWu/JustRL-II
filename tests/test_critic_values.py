@@ -364,16 +364,41 @@ def test_spearman_matches_known_values(critic_mod):
     assert critic_mod.spearman([1, 1, 1], [1, 2, 3]) is None  # zero variance
 
 
-def test_per_prompt_grouping_recovers_the_real_sample_size(critic_mod, capsys):
-    """V(s_0) is a function of the prompt, so N samples of one prompt share it exactly.
+def _rec(prompt, v0, correct, v_last=0.5, v_mean=0.5, n_response=100):
+    return {
+        "prompt_key": prompt,
+        "v0": v0,
+        "v_mean": v_mean,
+        "v_last": v_last,
+        "n_response": n_response,
+        "neg_len": -n_response,
+        "correct": correct,
+    }
 
-    Reported as 24 sample-level rows this looks like n=24; it is 3 prompts. The
-    grouping is what stops a sample-level AUC on V(s_0) from being read as evidence.
+
+def test_per_prompt_groups_by_prompt_not_by_v0(critic_mod, capsys):
+    """bf16 rounding scatters one prompt's V(s_0) across adjacent ticks.
+
+    0.439453 and 0.441406 are exactly 1 ulp apart at that magnitude, and the real
+    16k-run table showed one prompt split into groups of 15 and 1 that way. Keying on
+    V(s_0) would report 2 prompts where there is 1, inflating the sample size that
+    every V(s_0) claim rests on.
     """
-    records = [{"v0": 0.41, "v_mean": 0.5, "v_last": 0.6, "n_response": 100, "correct": True}] * 8
-    records += [{"v0": 0.45, "v_mean": 0.5, "v_last": 0.5, "n_response": 100, "correct": True}] * 4
-    records += [{"v0": 0.45, "v_mean": 0.5, "v_last": 0.5, "n_response": 100, "correct": False}] * 4
-    records += [{"v0": 0.47, "v_mean": 0.5, "v_last": 0.4, "n_response": 100, "correct": False}] * 8
+    records = [_rec("A", 0.439453, True) for _ in range(15)]
+    records += [_rec("A", 0.441406, True)]  # same prompt, one bf16 tick up
+    records += [_rec("B", 0.478516, False) for _ in range(16)]
+
+    critic_mod._report_per_prompt(records)
+
+    assert "2 distinct prompts" in capsys.readouterr().out
+
+
+def test_per_prompt_grouping_recovers_the_real_sample_size(critic_mod, capsys):
+    """N samples of one prompt share V(s_0), so row count is not sample size."""
+    records = [_rec("A", 0.41, True, v_last=0.6) for _ in range(8)]
+    records += [_rec("B", 0.45, True, v_last=0.5) for _ in range(4)]
+    records += [_rec("B", 0.45, False, v_last=0.4) for _ in range(4)]
+    records += [_rec("C", 0.47, False, v_last=0.4) for _ in range(8)]
 
     critic_mod._report_per_prompt(records)
 
@@ -383,31 +408,70 @@ def test_per_prompt_grouping_recovers_the_real_sample_size(critic_mod, capsys):
     assert "-1.000" in out
     # |rho| = 1 is strong ranking (inverted, but strong), so the "no signal" hint must
     # NOT fire here -- it is reserved for |rho| < 0.3, which is what the real 16k run
-    # shows (rho = -0.26 over 9 prompts).
+    # shows (rho = -0.45 over 7 prompts once the bf16 split is merged).
     assert "does not rank prompt difficulty" not in out
+    # Only prompt B has both classes, so the within-prompt AUC rests on its pairs.
+    assert "within-prompt AUC" in out
+
+
+def test_within_prompt_auc_controls_for_difficulty(critic_mod, capsys):
+    """Across prompts, V_last looks perfect; within prompts it is useless.
+
+    That gap is exactly the confound the sample-level number hides: difficulty varies
+    far more between prompts than response quality does inside one.
+    """
+    records = []
+    for i in range(8):  # easy prompt: all correct, V_last high
+        records.append(_rec("easy", 0.41, True, v_last=0.9 - i * 0.001))
+    for i in range(8):  # hard prompt: all wrong, V_last low
+        records.append(_rec("hard", 0.47, False, v_last=0.1 + i * 0.001))
+    # one prompt with both classes, where V_last carries NO within-prompt signal
+    records += [_rec("mixed", 0.44, True, v_last=0.5), _rec("mixed", 0.44, False, v_last=0.5)]
+
+    critic_mod._report_per_prompt(records)
+
+    out = capsys.readouterr().out
+    assert "3 distinct prompts" in out
+    # ties -> 0.5, i.e. no within-prompt discrimination, despite a perfect split across
+    # prompts (which a sample-level AUC would have reported as ~1.0)
+    assert "V_last" in out and "0.500" in out
+
+
+def test_per_prompt_skips_unlabelled_and_single_prompt(critic_mod, capsys):
+    critic_mod._report_per_prompt([_rec("A", 0.4, None), _rec("B", 0.5, None)])
+    assert capsys.readouterr().out == ""
+
+    critic_mod._report_per_prompt([_rec("A", 0.4, True), _rec("A", 0.4, False)])
+    assert capsys.readouterr().out == ""
 
 
 def test_per_prompt_flags_a_head_that_does_not_rank_difficulty(critic_mod, capsys):
-    """The real 16k-run table: V(s_0) varies but barely correlates with accuracy.
-
-    (V(s_0), n_samples, n_correct) as measured on AIME-2025, which gives rho = -0.26
-    over 9 prompts -- inside the |rho| < 0.3 band the hint is meant to catch.
-    """
-    real = [
-        (0.4160, 8, 8),
-        (0.4395, 6, 4),
-        (0.4414, 2, 1),
-        (0.4531, 8, 7),
-        (0.4551, 8, 8),
-        (0.4590, 8, 8),
-        (0.4648, 8, 1),
-        (0.4727, 8, 8),
-        (0.4785, 8, 0),
-    ]
+    """The real 16k-run table (100 samples, bf16 split merged): rho = -0.45 over 7
+    prompts. |rho| >= 0.3 so the hint does NOT fire; the 64-sample pass gave -0.26 and
+    it did. Pin both ends of that boundary."""
+    real = [(0.4160, 16, 16), (0.4395, 16, 13), (0.4531, 4, 3), (0.4551, 16, 15),
+            (0.4648, 16, 4), (0.4727, 16, 16), (0.4785, 16, 0)]
     records = []
     for v0, n, n_right in real:
-        records += [{"v0": v0, "correct": True}] * n_right
-        records += [{"v0": v0, "correct": False}] * (n - n_right)
+        records += [_rec(f"p{v0}", v0, True) for _ in range(n_right)]
+        records += [_rec(f"p{v0}", v0, False) for _ in range(n - n_right)]
+
+    critic_mod._report_per_prompt(records)
+
+    out = capsys.readouterr().out
+    assert "7 distinct prompts" in out
+    assert "-0.450" in out
+    assert "does not rank prompt difficulty" not in out
+
+
+def test_flags_no_difficulty_ranking_below_the_threshold(critic_mod, capsys):
+    """rho = -0.26, the 64-sample pass -- inside |rho| < 0.3, so the hint fires."""
+    real = [(0.4160, 8, 8), (0.4395, 6, 4), (0.4414, 2, 1), (0.4531, 8, 7), (0.4551, 8, 8),
+            (0.4590, 8, 8), (0.4648, 8, 1), (0.4727, 8, 8), (0.4785, 8, 0)]
+    records = []
+    for v0, n, n_right in real:
+        records += [_rec(f"p{v0}", v0, True) for _ in range(n_right)]
+        records += [_rec(f"p{v0}", v0, False) for _ in range(n - n_right)]
 
     critic_mod._report_per_prompt(records)
 
@@ -415,14 +479,6 @@ def test_per_prompt_flags_a_head_that_does_not_rank_difficulty(critic_mod, capsy
     assert "9 distinct prompts" in out
     assert "-0.261" in out
     assert "does not rank prompt difficulty" in out
-
-
-def test_per_prompt_skips_unlabelled_and_single_prompt(critic_mod, capsys):
-    critic_mod._report_per_prompt([{"v0": 0.4, "correct": None}, {"v0": 0.5, "correct": None}])
-    assert capsys.readouterr().out == ""
-
-    critic_mod._report_per_prompt([{"v0": 0.4, "correct": True}, {"v0": 0.4, "correct": False}])
-    assert capsys.readouterr().out == ""
 
 
 def test_auc_ranks_correct_above_wrong(critic_mod):
