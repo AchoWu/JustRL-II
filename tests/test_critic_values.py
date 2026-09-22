@@ -355,6 +355,76 @@ def test_repo_root_does_not_shadow_sglang(critic_mod, tmp_path):
     assert "ok" in out.stdout
 
 
+def test_spearman_matches_known_values(critic_mod):
+    assert critic_mod.spearman([1, 2, 3, 4], [1, 2, 3, 4]) == pytest.approx(1.0)
+    assert critic_mod.spearman([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1.0)
+    # Ties must get averaged ranks, or the coefficient is biased.
+    assert critic_mod.spearman([1, 1, 2, 2], [1, 1, 2, 2]) == pytest.approx(1.0)
+    assert critic_mod.spearman([1, 2], [1, 2]) is None  # n < 3
+    assert critic_mod.spearman([1, 1, 1], [1, 2, 3]) is None  # zero variance
+
+
+def test_per_prompt_grouping_recovers_the_real_sample_size(critic_mod, capsys):
+    """V(s_0) is a function of the prompt, so N samples of one prompt share it exactly.
+
+    Reported as 24 sample-level rows this looks like n=24; it is 3 prompts. The
+    grouping is what stops a sample-level AUC on V(s_0) from being read as evidence.
+    """
+    records = [{"v0": 0.41, "v_mean": 0.5, "v_last": 0.6, "n_response": 100, "correct": True}] * 8
+    records += [{"v0": 0.45, "v_mean": 0.5, "v_last": 0.5, "n_response": 100, "correct": True}] * 4
+    records += [{"v0": 0.45, "v_mean": 0.5, "v_last": 0.5, "n_response": 100, "correct": False}] * 4
+    records += [{"v0": 0.47, "v_mean": 0.5, "v_last": 0.4, "n_response": 100, "correct": False}] * 8
+
+    critic_mod._report_per_prompt(records)
+
+    out = capsys.readouterr().out
+    assert "3 distinct prompts" in out
+    # Perfectly anti-correlated: the lowest V(s_0) had the highest accuracy.
+    assert "-1.000" in out
+    # |rho| = 1 is strong ranking (inverted, but strong), so the "no signal" hint must
+    # NOT fire here -- it is reserved for |rho| < 0.3, which is what the real 16k run
+    # shows (rho = -0.26 over 9 prompts).
+    assert "does not rank prompt difficulty" not in out
+
+
+def test_per_prompt_flags_a_head_that_does_not_rank_difficulty(critic_mod, capsys):
+    """The real 16k-run table: V(s_0) varies but barely correlates with accuracy.
+
+    (V(s_0), n_samples, n_correct) as measured on AIME-2025, which gives rho = -0.26
+    over 9 prompts -- inside the |rho| < 0.3 band the hint is meant to catch.
+    """
+    real = [
+        (0.4160, 8, 8),
+        (0.4395, 6, 4),
+        (0.4414, 2, 1),
+        (0.4531, 8, 7),
+        (0.4551, 8, 8),
+        (0.4590, 8, 8),
+        (0.4648, 8, 1),
+        (0.4727, 8, 8),
+        (0.4785, 8, 0),
+    ]
+    records = []
+    for v0, n, n_right in real:
+        records += [{"v0": v0, "correct": True}] * n_right
+        records += [{"v0": v0, "correct": False}] * (n - n_right)
+
+    critic_mod._report_per_prompt(records)
+
+    out = capsys.readouterr().out
+    assert "9 distinct prompts" in out
+    assert "-0.261" in out
+    assert "does not rank prompt difficulty" in out
+
+
+def test_per_prompt_skips_unlabelled_and_single_prompt(critic_mod, capsys):
+    critic_mod._report_per_prompt([{"v0": 0.4, "correct": None}, {"v0": 0.5, "correct": None}])
+    assert capsys.readouterr().out == ""
+
+    critic_mod._report_per_prompt([{"v0": 0.4, "correct": True}, {"v0": 0.4, "correct": False}])
+    assert capsys.readouterr().out == ""
+
+
 def test_auc_ranks_correct_above_wrong(critic_mod):
     assert critic_mod.auc([0.9, 0.8], [0.1, 0.2]) == 1.0
     assert critic_mod.auc([0.1, 0.2], [0.9, 0.8]) == 0.0

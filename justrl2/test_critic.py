@@ -326,6 +326,70 @@ def grade(row: dict) -> bool | None:
     return bool(grade_answer_union(row["response"], str(row["label"])))
 
 
+def spearman(xs: list[float], ys: list[float]) -> float | None:
+    """Rank correlation. Used for V(s_0) vs per-prompt accuracy, where n is small."""
+    n = len(xs)
+    if n < 3:
+        return None
+
+    def ranks(vs: list[float]) -> list[float]:
+        order = sorted(range(n), key=lambda i: vs[i])
+        out = [0.0] * n
+        i = 0
+        while i < n:  # average ranks within ties, or the coefficient is biased
+            j = i
+            while j + 1 < n and vs[order[j + 1]] == vs[order[i]]:
+                j += 1
+            avg = (i + j) / 2
+            for k in range(i, j + 1):
+                out[order[k]] = avg
+            i = j + 1
+        return out
+
+    rx, ry = ranks(xs), ranks(ys)
+    mx, my = sum(rx) / n, sum(ry) / n
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=False))
+    den = (sum((a - mx) ** 2 for a in rx) * sum((b - my) ** 2 for b in ry)) ** 0.5
+    return num / den if den else None
+
+
+def _report_per_prompt(records: list[dict]) -> None:
+    """Group by V(s_0) to recover per-prompt behaviour.
+
+    V(s_0) is a function of the prompt alone, so every sample of the same prompt shares
+    it exactly — which means it doubles as a prompt id here, and the number of distinct
+    values is the real sample size for any claim about V(s_0). With 8 samples per
+    prompt a 64-row table is 8 prompts, and a sample-level AUC on V(s_0) is dominated
+    by which prompts happened to be easy, not by whether V ranks them.
+    """
+    groups: dict[float, list[dict]] = {}
+    for r in records:
+        if r["correct"] is not None:
+            groups.setdefault(round(r["v0"], 4), []).append(r)
+    if len(groups) < 2:
+        return
+
+    print(
+        f"\n  per-prompt (V(s_0) is a function of the prompt, so it groups them): "
+        f"{len(groups)} distinct prompts"
+    )
+    print(f"    {'V(s_0)':>8} {'n':>3} {'acc':>6}")
+    v0s, accs = [], []
+    for v0 in sorted(groups):
+        rows = groups[v0]
+        acc = sum(1 for r in rows if r["correct"]) / len(rows)
+        v0s.append(v0)
+        accs.append(acc)
+        print(f"    {v0:>8.4f} {len(rows):>3} {acc:>6.3f}")
+
+    rho = spearman(v0s, accs)
+    if rho is not None:
+        print(f"    Spearman(V(s_0), per-prompt acc) = {rho:+.3f} over {len(groups)} prompts")
+        if abs(rho) < 0.3:
+            print("    -> V(s_0) does not rank prompt difficulty. The head's prompt-level")
+            print("       signal is noise; only the response-conditioned values carry any.")
+
+
 def run_samples(args, state_dict, megatron_args) -> None:
     from transformers import AutoTokenizer
 
@@ -398,12 +462,35 @@ def run_samples(args, state_dict, megatron_args) -> None:
         print("       PPO's advantage would collapse to whitened reward. Check --inspect output.")
 
     if v0_correct and v0_wrong:
-        a = auc(v0_correct, v0_wrong)
-        print(f"  V(s_0) | correct   mean={statistics.mean(v0_correct):.4f}  n={len(v0_correct)}")
-        print(f"  V(s_0) | wrong     mean={statistics.mean(v0_wrong):.4f}  n={len(v0_wrong)}")
-        print(f"  AUC             {a:.4f}   (0.5 = no discrimination)")
+        # Report AUC for all three, because V(s_0) alone is the least informative and
+        # reading only it has already produced one wrong conclusion. V(s_0) depends on
+        # the PROMPT only, so with n samples per prompt its effective sample size is
+        # the number of distinct prompts, and a sample-level AUC on it mostly measures
+        # "did the easy prompts happen to be sampled more" -- see the per-prompt table
+        # below. V_last is the value after reading the whole response and is what PPO
+        # actually differences against.
+        print("\n  AUC by feature (0.5 = no discrimination):")
+        for key, label in (("v0", "V(s_0)  prompt only"), ("v_mean", "V_mean"), ("v_last", "V_last  full response")):
+            pos = [r[key] for r in records if r["correct"] is True]
+            neg = [r[key] for r in records if r["correct"] is False]
+            a = auc(pos, neg)
+            if a is not None:
+                print(
+                    f"    {label:22s} AUC={a:.4f}   mean|correct={statistics.mean(pos):.4f} "
+                    f"mean|wrong={statistics.mean(neg):.4f}"
+                )
+        # Length as a baseline: if V_last cannot beat "shorter answers are right", the
+        # head is not adding anything a two-line heuristic would not give.
+        pos_len = [-r["n_response"] for r in records if r["correct"] is True]
+        neg_len = [-r["n_response"] for r in records if r["correct"] is False]
+        a_len = auc(pos_len, neg_len)
+        if a_len is not None:
+            print(f"    {'(baseline: -length)':22s} AUC={a_len:.4f}   <- V_last should beat this")
+
+        _report_per_prompt(records)
+
         acc = len(v0_correct) / (len(v0_correct) + len(v0_wrong))
-        print(f"  actual accuracy {acc:.4f}   vs mean V(s_0) {statistics.mean(all_v0):.4f}")
+        print(f"\n  actual accuracy {acc:.4f}   vs mean V(s_0) {statistics.mean(all_v0):.4f}")
         print("    (CRITIC_EXCLUDE_OLP=1 makes V(s_0) an estimate of P(correct), so these")
         print("     two should be close if the critic is calibrated)")
     else:
