@@ -46,6 +46,7 @@ import json
 import statistics
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.distributed.checkpoint as dist_cp
@@ -62,13 +63,26 @@ VALUE_HEAD_BIAS = "output_layer.bias"
 HIDDEN_RMS_ESTIMATE = 4.0
 
 
-def load_dist_state_dict(input_dir: Path) -> tuple[dict, object]:
-    """Read a Megatron dist checkpoint into a plain state dict, on CPU, single process."""
-    # Importing the tools module installs its pickle stub for megatron classes, which
-    # torch.load(common.pt) needs — common.pt pickles a megatron Namespace.
+def load_dist_state_dict(input_dir: Path) -> tuple[dict, object | None]:
+    """Read a Megatron dist checkpoint into a plain state dict, on CPU, single process.
+
+    The tensors live in the `__*.distcp` shards and are indexed by the `.metadata`
+    dotfile; that pair is the whole checkpoint as far as `torch.distributed.checkpoint`
+    is concerned. `common.pt` is a *separate* file carrying the pickled megatron
+    Namespace, and megatron only writes it in some configurations — the training
+    checkpoints on this recipe do not have one. So it is optional here: returns
+    `None` when absent, and `megatron_args_from_hf_config` rebuilds what the name
+    mapping needs from the HF config instead.
+    """
     from tools.convert_torch_dist_to_hf import EmptyStateDictLoadPlanner, WrappedStorageReader
 
-    megatron_args = torch.load(input_dir / "common.pt", weights_only=False)["args"]
+    megatron_args = None
+    common = input_dir / "common.pt"
+    if common.is_file():
+        # Importing the tools module above installs its pickle stub for megatron
+        # classes, which unpickling this Namespace needs.
+        megatron_args = torch.load(common, weights_only=False)["args"]
+
     state_dict: dict = {}
     dist_cp.state_dict_loader._load_state_dict(
         state_dict,
@@ -77,6 +91,34 @@ def load_dist_state_dict(input_dir: Path) -> tuple[dict, object]:
         no_dist=True,
     )
     return state_dict, megatron_args
+
+
+def megatron_args_from_hf_config(base_hf_dir: Path, state_dict: dict):
+    """Rebuild the handful of megatron args the name mapping needs, from the HF config.
+
+    Only six fields are ever read: `num_layers` and `num_experts` (to unpack megatron's
+    packed-layer dimension) and `hidden_size` / `num_attention_heads` /
+    `num_query_groups` / `kv_channels` (to split the fused QKV). Every one of them is
+    in the HF config the model was converted from, so a missing `common.pt` is not a
+    blocker. `vocab_size` is deliberately absent: it only feeds `remove_padding`, and
+    the critic has no vocab-shaped tensor to unpad.
+    """
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(base_hf_dir, trust_remote_code=True)
+    hidden = cfg.hidden_size
+    heads = cfg.num_attention_heads
+    return SimpleNamespace(
+        num_layers=cfg.num_hidden_layers,
+        hidden_size=hidden,
+        num_attention_heads=heads,
+        num_query_groups=getattr(cfg, "num_key_value_heads", None) or heads,
+        kv_channels=getattr(cfg, "head_dim", None) or hidden // heads,
+        vocab_size=cfg.vocab_size,
+        num_experts=getattr(cfg, "num_experts", None),
+        q_lora_rank=None,
+        sglang_enable_ep_moe=False,
+    )
 
 
 def inspect_value_head(state_dict: dict, megatron_args) -> dict:
@@ -126,9 +168,15 @@ def inspect_value_head(state_dict: dict, megatron_args) -> dict:
         f"absmax={info['absmax']:.6g} rms={info['rms']:.6g} L2={w_l2:.4g}"
     )
     print(f"    bias          {info['bias']!r}  (init was {bias_init!r})")
-    print(f"  gae_lambda_k    {info['gae_lambda_k']}")
-    print(f"  exclude OLP     {info['critic_exclude_overlong_penalty']}")
-    print(f"  critic_lr       {info['critic_lr']}")
+    if megatron_args is None:
+        # These four come only from common.pt, which megatron did not write for this
+        # checkpoint. Say so once instead of printing four bare Nones that look like
+        # the recipe knobs were unset.
+        print("  recipe knobs    (unavailable: no common.pt in this checkpoint)")
+    else:
+        print(f"  gae_lambda_k    {info['gae_lambda_k']}")
+        print(f"  exclude OLP     {info['critic_exclude_overlong_penalty']}")
+        print(f"  critic_lr       {info['critic_lr']}")
     print(f"  est. V spread   ~+-{info['est_v_spread']:.4f} around the {info['bias']:.4f} prior")
     print(f"                  (= ||w||_2 x rms(h), rms(h)~{HIDDEN_RMS_ESTIMATE:g}; --samples measures it for real)")
 
@@ -176,6 +224,8 @@ def build_critic(state_dict: dict, megatron_args, base_hf_dir: Path, model_name:
 
     if model_name is None:
         model_name = type(AutoConfig.from_pretrained(base_hf_dir, trust_remote_code=True)).__name__.lower()
+    if megatron_args is None:
+        megatron_args = megatron_args_from_hf_config(base_hf_dir, state_dict)
     # Re-check the shape here and not only in inspect_value_head: pointed at an actor
     # checkpoint, output_layer.weight is [vocab, H], and silently taking its first row
     # as a value head would produce numbers that look like values and are not.
@@ -360,11 +410,15 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="write per-sample values to this jsonl")
     args = ap.parse_args()
 
+    # `.metadata` (a dotfile) + the `__*.distcp` shards ARE the checkpoint; common.pt
+    # is optional and megatron does not write it here. Check for the real thing, or a
+    # parent save dir gets rejected for the wrong reason while a genuine checkpoint
+    # gets rejected for no reason at all.
     critic = Path(args.critic)
-    if not (critic / "common.pt").is_file():
-        candidates = sorted(p.name for p in critic.glob("iter_*") if (p / "common.pt").is_file())
+    if not (critic / ".metadata").is_file():
+        candidates = sorted(p.name for p in critic.glob("iter_*") if (p / ".metadata").is_file())
         hint = f" Did you mean {critic / candidates[-1]}?" if candidates else ""
-        raise SystemExit(f"{critic}/common.pt not found — not a dist checkpoint dir.{hint}")
+        raise SystemExit(f"{critic}/.metadata not found — not a dist checkpoint dir.{hint}")
 
     print("=" * 60)
     print(f"critic: {critic}")

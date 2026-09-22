@@ -239,6 +239,16 @@ one key per module with the layer as a shard dimension, so
 `decoder.layers.self_attention.linear_qkv.weight` is a single `(42, 2560, 2048)`
 entry and `layers.0.*` matches nothing. 180 keys is normal, not evidence of loss.
 
+And the checkpoint is `__*.distcp` plus a `.metadata` **dotfile** — that pair is the
+whole thing as far as `torch.distributed.checkpoint` is concerned. `ll` hides the
+dotfile, so a valid checkpoint can look like bare shards. `common.pt` (the pickled
+megatron `Namespace`) is a *separate* file that these training runs do not write, so
+never gate on its presence: `tools/convert_torch_dist_to_hf.py` loads it
+unconditionally and will fail here, while `justrl2/test_critic.py` treats it as
+optional and rebuilds the six fields the name mapping needs (`num_layers`,
+`num_experts`, `hidden_size`, `num_attention_heads`, `num_query_groups`,
+`kv_channels`) from the HF config instead.
+
 ### Diagnostics left in the tree
 
 `[vh-diag]` logging in `model.py`, `model_provider.py`, `checkpoint.py` and

@@ -267,6 +267,58 @@ def test_backbone_conversion_drops_the_value_head(critic_mod):
         assert f"model.layers.{i}.self_attn.q_proj.weight" in hf_tensors
 
 
+def test_args_rebuilt_from_hf_config_when_common_pt_is_absent(critic_mod, tmp_path):
+    """megatron does not write common.pt for these training checkpoints, so the six
+    fields the name mapping reads must come from the HF config instead. Requiring
+    common.pt rejected a perfectly valid checkpoint."""
+    import json
+
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": H,
+                "num_hidden_layers": N_LAYERS,
+                "num_attention_heads": NAH,
+                "num_key_value_heads": NQG,
+                "head_dim": KVC,
+                "intermediate_size": FFN,
+                "vocab_size": VOCAB,
+                "rms_norm_eps": 1e-6,
+            }
+        )
+    )
+
+    rebuilt = critic_mod.megatron_args_from_hf_config(base, _critic_state_dict())
+
+    # Exactly the fields get_named_params + the per-model converter read.
+    assert rebuilt.num_layers == N_LAYERS
+    assert rebuilt.hidden_size == H
+    assert rebuilt.num_attention_heads == NAH
+    assert rebuilt.num_query_groups == NQG
+    assert rebuilt.kv_channels == KVC
+    assert rebuilt.num_experts is None
+    # and the conversion actually runs on them
+    hf_tensors = critic_mod.convert_backbone(_critic_state_dict(), rebuilt, "llama")
+    assert f"model.layers.{N_LAYERS - 1}.self_attn.q_proj.weight" in hf_tensors
+
+
+def test_inspect_tolerates_missing_megatron_args(critic_mod, capsys):
+    """Without common.pt the recipe knobs are unknown; the head report must still
+    work rather than crash on getattr, and must say so instead of printing Nones."""
+    info = critic_mod.inspect_value_head(_critic_state_dict(), None)
+
+    assert info["nonzero"] == H
+    assert info["bias"] == pytest.approx(0.52)
+    assert info["gae_lambda_k"] is None
+    out = capsys.readouterr().out
+    assert "no common.pt" in out
+    assert "gae_lambda_k" not in out
+
+
 def test_auc_ranks_correct_above_wrong(critic_mod):
     assert critic_mod.auc([0.9, 0.8], [0.1, 0.2]) == 1.0
     assert critic_mod.auc([0.1, 0.2], [0.9, 0.8]) == 0.0
