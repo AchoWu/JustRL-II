@@ -84,10 +84,35 @@ python justrl2/eval.py --model runs/<EXP_TAG>/hf/iter_0000299 \
     --n 16 --temperature 1.0 --top-p 0.95 --max-tokens 126976
 ```
 
+Score with the critic. It has **no HF export** — `_should_save_hf` in `actor.py`
+returns `False` for `role != "actor"` — and it does not need one: this reads the dist
+checkpoint directly and writes nothing.
+```bash
+python justrl2/test_critic.py --critic runs/<EXP_TAG>_critic/iter_0000499 --inspect
+python justrl2/test_critic.py --critic runs/<EXP_TAG>_critic/iter_0000499 \
+    --base models/JustRL-II-base-model --samples samples.jsonl --device cuda
+```
+`--inspect` reports the value head alone (seconds, no backbone load). With
+`--samples` it assembles the critic in memory — `AutoModel` backbone plus an
+`nn.Linear(H, 1)` — and reports `V(s)` plus the correct-vs-wrong AUC. Note
+`tools/convert_torch_dist_to_hf.py` cannot be pointed at a critic: the per-model
+converters map `output_layer.weight` to `lm_head.weight` (the critic's is `[1, H]`,
+not `[vocab, H]`) and raise `ValueError: Unknown parameter name` on
+`output_layer.bias`, so `convert_backbone` holds the head back and applies it
+separately.
+
+The alignment matches training and is the easy thing to get wrong:
+`V(s_t) = head(h[prompt_len + t - 1])`, because `get_responses` slices
+`logits[start - 1 : end - 1]`. So `V(s_0)` is the head at the *last prompt position*
+— the value of the prompt before any response token exists — and with
+`CRITIC_EXCLUDE_OLP=1` it estimates P(correct), so it can be compared against
+measured accuracy for calibration.
+
 Recipe-only unit tests (no GPU / Megatron / SGLang needed):
 ```bash
 python examples/value_head_demo.py
-python -m pytest tests/test_gae_lambda_k.py tests/test_critic_value_bias_init.py tests/test_chunked_gae.py
+python -m pytest tests/test_gae_lambda_k.py tests/test_critic_value_bias_init.py tests/test_chunked_gae.py \
+    tests/test_critic_values.py
 ```
 
 Run a single pytest test:
@@ -189,6 +214,18 @@ Each of these cost a round of investigation; they will mislead again.
 - **`main_absmax` in the `[critic-value-head]` lines is weight-OR-bias.**
   `_value_head_main_param_absmax` maxes over both, so the familiar `0.5196` is the
   *bias*.
+- **A bias frozen at `0.519531` in the `[vh-diag] pre-step` lines is bf16 display
+  resolution, not a stuck parameter.** Those lines print the *model* param, which is
+  bf16; one ulp at 0.52 is `2^-8 = 0.0039`, so at `critic_lr=5e-6` it takes ~390
+  same-sign steps to move a single visible tick and the printed value never changes.
+  The fp32 master in the adjacent `head main-param absmax=` line does move —
+  `0.519531 -> 0.519406` over the 500-step 16k run, and `lr * weight_decay * p * 500
+  = 1.30e-4` against an observed `1.25e-4` says that drift is ~96% weight decay
+  (`weight_decay=0.1` applies to the bias too). Read the master line, not the
+  pre-step one, and treat an unchanging bias as evidence only when the master is also
+  flat. Distinct from the zero-weight failure above: there the *weight* was exactly 0
+  while the bias had gradient; here both have gradient (bias `main_grad` median
+  0.070) and the value is simply below what bf16 can show.
 - **`id()` against `optimizer.param_groups` always reports 0.** The distributed
   optimizer stores fp32 *master* copies there, never the model's bf16 params.
 - **Coherent rollout text proves nothing about the megatron forward** — it comes from
