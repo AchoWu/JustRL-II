@@ -19,7 +19,21 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from pathlib import Path
+
+# Run as `python justrl2/eval.py`, sys.path[0] is `justrl2/`, so neither the repo root
+# nor the sglang checkout is importable. Add both — and put `sglang/python` FIRST:
+# `<repo>/sglang` is a source checkout whose package lives one level down at
+# `sglang/python/sglang`, so a repo root ahead of it makes the bare `<repo>/sglang/`
+# directory win as an implicit namespace package and shadow the real install
+# (`import sglang` then has `__file__ is None` and no `srt`). train.sh sets
+# PYTHONPATH=.:Megatron-LM:${SGLANG_PATH}/python for the same reason.
+_PREPEND = [
+    Path(__file__).resolve().parent.parent / "sglang" / "python",
+    Path(__file__).resolve().parent.parent,
+]
+sys.path[:0] = [str(p) for p in _PREPEND if p.is_dir()]
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -40,21 +54,6 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="write per-sample records to this jsonl")
     args = ap.parse_args()
 
-    # `<repo>/sglang` is a checkout of the sglang source tree; the importable package sits
-    # one level down at `sglang/python/sglang`. So putting the repo root at sys.path[0]
-    # makes the bare `<repo>/sglang/` directory win as an implicit namespace package and
-    # shadow the real install: `import sglang` then yields a module with `__file__ = None`
-    # and no `srt` submodule, and every `sglang.srt.*` import under miles dies. train.sh
-    # sidesteps this with PYTHONPATH=.:Megatron-LM:${SGLANG_PATH}/python — do the same,
-    # putting the checkout's python/ dir ahead of the repo root so the real package is
-    # found first either way.
-    #
-    # `miles` and `tools` come from the repo root; it is normally `pip install -e .` (see
-    # bare_metal_cu129.sh), so that entry is belt-and-braces for a plain checkout.
-    import sys
-    _REPO_ROOT = Path(__file__).resolve().parent.parent
-    _PREPEND = [_REPO_ROOT / "sglang" / "python", _REPO_ROOT]
-    sys.path[:0] = [str(p) for p in _PREPEND if p.is_dir()]
     import sglang as sgl
     from transformers import AutoTokenizer
 
