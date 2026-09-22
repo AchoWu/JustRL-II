@@ -51,7 +51,21 @@ from types import SimpleNamespace
 import torch
 import torch.distributed.checkpoint as dist_cp
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# `<repo>/sglang` is a checkout of the sglang source tree; the importable package sits
+# one level down at `sglang/python/sglang`. So putting the repo root at sys.path[0]
+# makes the bare `<repo>/sglang/` directory win as an implicit namespace package and
+# shadow the real install: `import sglang` then yields a module with `__file__ = None`
+# and no `srt` submodule, and every `sglang.srt.*` import under miles dies. train.sh
+# sidesteps this with PYTHONPATH=.:Megatron-LM:${SGLANG_PATH}/python — do the same,
+# putting the checkout's python/ dir ahead of the repo root so the real package is
+# found first either way.
+#
+# `miles` and `tools` come from the repo root; it is normally `pip install -e .` (see
+# bare_metal_cu129.sh), so that entry is belt-and-braces for a plain checkout.
+_PREPEND = [_REPO_ROOT / "sglang" / "python", _REPO_ROOT]
+sys.path[:0] = [str(p) for p in _PREPEND if p.is_dir()]
 
 VALUE_HEAD_WEIGHT = "output_layer.weight"
 VALUE_HEAD_BIAS = "output_layer.bias"

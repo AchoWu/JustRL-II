@@ -239,6 +239,16 @@ one key per module with the layer as a shard dimension, so
 `decoder.layers.self_attention.linear_qkv.weight` is a single `(42, 2560, 2048)`
 entry and `layers.0.*` matches nothing. 180 keys is normal, not evidence of loss.
 
+One more trap for any standalone script under `justrl2/`: **never put the repo root
+at `sys.path[0]`.** `<repo>/sglang` is a checkout whose importable package is one
+level down at `sglang/python/sglang`, so a repo root in front makes the bare
+`<repo>/sglang/` directory win as an implicit namespace package — `import sglang`
+then returns a module with `__file__ is None` and no `srt`, and every `sglang.srt.*`
+import under `miles` raises `ModuleNotFoundError: No module named 'sglang.srt'` even
+though sglang is installed correctly. `train.sh` avoids it via
+`PYTHONPATH=.:Megatron-LM:${SGLANG_PATH}/python`; `justrl2/test_critic.py` prepends
+`sglang/python` ahead of the repo root for the same reason.
+
 And the checkpoint is `__*.distcp` plus a `.metadata` **dotfile** — that pair is the
 whole thing as far as `torch.distributed.checkpoint` is concerned. `ll` hides the
 dotfile, so a valid checkpoint can look like bare shards. `common.pt` (the pickled

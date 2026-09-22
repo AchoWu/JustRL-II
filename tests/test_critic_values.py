@@ -319,6 +319,42 @@ def test_inspect_tolerates_missing_megatron_args(critic_mod, capsys):
     assert "gae_lambda_k" not in out
 
 
+def test_repo_root_does_not_shadow_sglang(critic_mod, tmp_path):
+    """`<repo>/sglang` is a source checkout whose package is at sglang/python/sglang.
+
+    Prepending the repo root alone makes the bare `<repo>/sglang/` directory win as an
+    implicit namespace package: `import sglang` yields `__file__ is None` and no
+    `srt`, so every `sglang.srt.*` import under miles dies. The checkout's python/
+    dir has to come first. Verified against a simulated layout in a subprocess,
+    because the import is a module-level side effect.
+    """
+    import subprocess
+    import textwrap
+
+    (tmp_path / "sglang" / "python" / "sglang" / "srt").mkdir(parents=True)
+    (tmp_path / "sglang" / "python" / "sglang" / "__init__.py").touch()
+    (tmp_path / "sglang" / "python" / "sglang" / "srt" / "__init__.py").touch()
+
+    script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        repo = Path(sys.argv[1])
+        prepend = [repo / "sglang" / "python", repo]
+        sys.path[:0] = [str(p) for p in prepend if p.is_dir()]
+        import sglang, sglang.srt
+        assert sglang.__file__ is not None, "shadowed by the bare <repo>/sglang dir"
+        assert str(repo) in sys.path, "repo root must stay importable for miles/tools"
+        print("ok")
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=120
+    )
+    assert out.returncode == 0, out.stderr
+    assert "ok" in out.stdout
+
+
 def test_auc_ranks_correct_above_wrong(critic_mod):
     assert critic_mod.auc([0.9, 0.8], [0.1, 0.2]) == 1.0
     assert critic_mod.auc([0.1, 0.2], [0.9, 0.8]) == 0.0
