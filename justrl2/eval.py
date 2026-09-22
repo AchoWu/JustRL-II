@@ -29,10 +29,13 @@ from pathlib import Path
 # directory win as an implicit namespace package and shadow the real install
 # (`import sglang` then has `__file__ is None` and no `srt`). train.sh sets
 # PYTHONPATH=.:Megatron-LM:${SGLANG_PATH}/python for the same reason.
+REPO_ROOT = Path("/group/40092/howu/JustRL-II")
+
 _PREPEND = [
-    Path(__file__).resolve().parent.parent / "sglang" / "python",
-    Path(__file__).resolve().parent.parent,
+    REPO_ROOT / "sglang" / "python",
+    REPO_ROOT,
 ]
+
 sys.path[:0] = [str(p) for p in _PREPEND if p.is_dir()]
 
 

@@ -64,7 +64,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 #
 # `miles` and `tools` come from the repo root; it is normally `pip install -e .` (see
 # bare_metal_cu129.sh), so that entry is belt-and-braces for a plain checkout.
-_PREPEND = [_REPO_ROOT / "sglang" / "python", _REPO_ROOT]
+REPO_ROOT = Path("/group/40092/howu/JustRL-II")
+
+_PREPEND = [
+    REPO_ROOT / "sglang" / "python",
+    REPO_ROOT,
+]
+
 sys.path[:0] = [str(p) for p in _PREPEND if p.is_dir()]
 
 VALUE_HEAD_WEIGHT = "output_layer.weight"
