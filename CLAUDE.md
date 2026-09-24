@@ -141,7 +141,7 @@ Style: black (line length 119), isort (black profile, `known_first_party = ["mil
 | `NUM_CRITIC_ONLY_STEPS`  | 30    | Critic converges before the first policy update. `actor.py` gates the policy update on `rollout_id >= num_critic_only_steps`. |
 
 `1node-8gpu-16k{,-baremetal}.env` is **not a reproduction of the recipe**, even though
-all five knobs above (plus `CRITIC_EXCLUDE_OLP`, `GAMMA`) are inherited untouched.
+the three knobs above (plus `CRITIC_EXCLUDE_OLP`, `GAMMA`) are inherited untouched.
 `λ_i = k^(1/L_i)` takes response length as its input, so capping at 14336 instead of
 30720 shifts the whole λ distribution — same `k`, shorter `L`, smaller λ, stronger
 discounting. Its curves are not comparable to the 32k or 128k ones. It exists because
@@ -149,6 +149,20 @@ discounting. Its curves are not comparable to the 32k or 128k ones. It exists be
 there: response len, context len, overlong buffer (20% of the response cap), and
 concurrency — context len matters as much as response len, since `train.sh` feeds it
 to `max_position_embeddings`, `sglang-context-length` and `sglang-max-prefill-tokens`.
+
+It also now overrides **`CRITIC_LR` to 2e-5** (recipe: 5e-6) — the one hyperparameter
+it deviates on. The 500-step run at 5e-6 left the value head badly under-fit:
+`output_layer.weight` reached only `absmax=2.7e-4` / `||w||_2=0.0041`, which against
+`rms(h) ≈ 4` lets `V(s)` vary by just ±0.016 around its 0.52 prior. Scored with
+`justrl2/test_critic.py` on AIME (100 samples, 7 prompts), `V(s_0)` ranks prompt
+difficulty at Spearman −0.45 (i.e. not at all) while `V_last` manages a within-prompt
+AUC of 0.833 against a 0.762 "shorter answers are more often right" baseline — real
+signal, thin margin. The head was under-trained, not broken (`nonzero=2048/2048`,
+`main_grad` 11–18 throughout). Unlike the three knobs above this only changes fitting
+speed, not the objective: the critic regresses the `λ=1` suffix-reward sum either way.
+**Starting a run at the new LR needs a fresh `EXP_TAG`** — `train.sh` finds the old
+run's actor+critic checkpoints and resumes at rollout 500, so with `NUM_ROLLOUT=500`
+not a single step would train.
 
 ## Critical implementation details (easy to break silently)
 
