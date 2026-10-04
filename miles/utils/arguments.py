@@ -919,6 +919,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "checkpoint whose output_layer is the LM head.",
             )
             parser.add_argument("--critic-save", type=str, default=None, help="The checkpoint for critic model.")
+            parser.add_argument(
+                "--archive-checkpoint-interval",
+                type=int,
+                default=None,
+                help="Copy every Nth saved checkpoint into <save>_archive/iter_xxx, out of reach of "
+                "Megatron's rotation. --save-retain-interval cannot do this: a save fires at "
+                "rollout_id+1 == k*save_interval but the directory is named for rollout_id, so the "
+                "retained iterations are k*save_interval-1, which is never a multiple of "
+                "save_retain_interval (itself asserted to be a multiple of save_interval). Applies to "
+                "whichever role sets it, so the actor and critic archives stay paired. Must be a "
+                "multiple of --save-interval or the two never coincide.",
+            )
             parser.add_argument("--critic-lr", type=float, default=None, help="The lr for critic model")
             parser.add_argument(
                 "--critic-lr-warmup-iters",

@@ -601,11 +601,46 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._should_save_hf(rollout_id):
             self._save_hf(rollout_id)
 
+        self._archive_checkpoint(rollout_id)
+
         if self.args.offload_train:
             destroy_process_groups()
 
         if woke_for_save:
             self.sleep()
+
+    def _archive_checkpoint(self, rollout_id: int) -> None:
+        """Keep an unrotated copy of this checkpoint, if it is an archive point.
+
+        See ``miles/utils/checkpoint_archive.py`` for why ``--save-retain-interval``
+        cannot do this. Only the collective part lives here: the barrier, and picking a
+        single writer.
+        """
+        from miles.utils.checkpoint_archive import archive_checkpoint, is_archive_point
+
+        if not self.args.save:
+            return
+        if not is_archive_point(
+            rollout_id,
+            getattr(self.args, "archive_checkpoint_interval", None),
+            self.args.num_rollout,
+        ):
+            return
+
+        # Every rank reaches this barrier -- is_archive_point is a pure function of
+        # rollout_id and static args, so ranks cannot disagree. The barrier itself
+        # matters: save() is collective, but returning on this rank does not prove the
+        # others have finished writing their shards, and copying a half-written tree
+        # would yield an archive that loads as garbage.
+        dist.barrier(group=get_gloo_group())
+
+        # One writer: all ranks of this role share the save dir, so concurrent copies
+        # into one destination would race. By now the tree is fully written, so this is
+        # a plain filesystem copy with no megatron semantics left. The actor and critic
+        # run in separate process groups (RayTrainGroup sizes a world per role), so each
+        # has its own rank 0 and both archives get written.
+        if dist.get_rank() == 0:
+            archive_checkpoint(self.args.save, rollout_id)
 
     def _should_save_hf(self, rollout_id: int) -> bool:
         if self.args.save_hf is None or self.role != "actor":

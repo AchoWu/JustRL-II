@@ -112,6 +112,20 @@ CKPT_ARGS=(
   --save-retain-interval "$SAVE_RETAIN_INTERVAL"
   --critic-save "$CRITIC_SAVE_DIR"
 )
+# ARCHIVE_INTERVAL: keep an unrotated copy of every Nth checkpoint, for BOTH roles, under
+# <save_dir>_archive/iter_xxx. The critic has no HF export, so without this only its last
+# dist ckpt survives the run — and if the best actor is not the last one, there is no
+# critic to pair with it. SAVE_RETAIN_INTERVAL cannot do this job: a save fires when
+# rollout_id+1 is a multiple of SAVE_INTERVAL but the directory is named for rollout_id,
+# so the iterations on disk are k*SAVE_INTERVAL-1 and never a multiple of a retain
+# interval that must itself be a multiple of SAVE_INTERVAL. Off by default: each archive
+# point costs a full actor+critic pair (~63 GB here).
+if [ -n "${ARCHIVE_INTERVAL:-}" ] && [ "$ARCHIVE_INTERVAL" != "0" ]; then
+  [ $((ARCHIVE_INTERVAL % SAVE_INTERVAL)) -eq 0 ] \
+    || { echo "FATAL: ARCHIVE_INTERVAL=$ARCHIVE_INTERVAL must be a multiple of SAVE_INTERVAL=$SAVE_INTERVAL;" \
+              "otherwise the archive points never coincide with a save and nothing is archived." >&2; exit 1; }
+  CKPT_ARGS+=(--archive-checkpoint-interval "$ARCHIVE_INTERVAL")
+fi
 if [ "$HF_SAVE_INTERVAL" != "0" ]; then
   CKPT_ARGS+=(--save-hf "${SAVE_DIR}/hf/iter_{rollout_id:07d}" --save-hf-interval "$HF_SAVE_INTERVAL")
 fi

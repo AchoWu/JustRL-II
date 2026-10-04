@@ -112,7 +112,7 @@ Recipe-only unit tests (no GPU / Megatron / SGLang needed):
 ```bash
 python examples/value_head_demo.py
 python -m pytest tests/test_gae_lambda_k.py tests/test_critic_value_bias_init.py tests/test_chunked_gae.py \
-    tests/test_critic_values.py
+    tests/test_critic_values.py tests/test_archive_checkpoint.py
 ```
 
 Run a single pytest test:
@@ -129,7 +129,8 @@ Style: black (line length 119), isort (black profile, `known_first_party = ["mil
 - PPO requires **actor world size == critic world size** — the actor↔critic NCCL groups are built rank-pairwise. `train.sh` defaults to `WORLD_SIZE/2` nodes each and refuses to start otherwise.
 - Global batch (`ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT`) must be divisible by actor DP (`nodes * gpus / TP / CP`).
 - Reference run: 16 × 8 H100, 8 actor + 8 critic nodes, SGLang engines colocated on all GPUs, `TP=1 / CP=4`, GBS 480 (60 prompts × 8 samples).
-- `SAVE_RETAIN_INTERVAL` must be a multiple of `SAVE_INTERVAL` (Megatron asserts).
+- `SAVE_RETAIN_INTERVAL` must be a multiple of `SAVE_INTERVAL` (Megatron asserts) — and under that constraint it **retains nothing, for every legal value**. A save fires when `rollout_id + 1` is a multiple of `SAVE_INTERVAL` (`misc.should_run_periodic_action` sets `step = rollout_id + 1`) while the directory is named for `rollout_id`, so on-disk iterations are `k*SAVE_INTERVAL - 1` and retention would need `k*S - 1 ≡ 0 (mod m*S)` — unsolvable for `S > 1`. "Exactly one actor + one critic checkpoint stays on disk" is forced, not configured. Use `ARCHIVE_INTERVAL` to keep intermediate ones.
+- `ARCHIVE_INTERVAL=<multiple of SAVE_INTERVAL>` copies every Nth checkpoint to `<save_dir>_archive/iter_xxx` for **both roles**, outside the rotated dir. Off by default — each archive point costs a full actor+critic pair (~63 GB on the 16k config). Needed whenever the best actor is not the last one: the critic has no HF export, so otherwise only its final dist checkpoint survives and there is nothing to pair an earlier actor with. Rank 0 of each role copies after a barrier (`actor.py:_archive_checkpoint`); the copy itself is `miles/utils/checkpoint_archive.py`, kept import-light so it is testable without the stack.
 - `MEGATRON_MODEL_PATH` must point at the parent `torch_dist` directory, **not** an `iter_xxx` subdirectory — otherwise Megatron silently starts from random weights.
 
 ## The three recipe knobs that matter (do not change casually)
