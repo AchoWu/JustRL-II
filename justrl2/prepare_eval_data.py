@@ -33,8 +33,12 @@ Multiple-choice rows carry `metadata.kind = "mc"` plus `metadata.choices` (the
 letter -> option-text map) so the grader can also accept a boxed option *value*;
 everything else is `kind = "math"` and graded by miles' `math` reward verbatim.
 
-Sources: the Qwen2.5-Math mirror on GitHub for the 9 conventional sets (one uniform
-schema, no `datasets` dependency) and `math-ai/aime{24,25,26}` for AIME.
+Sources: the Qwen2.5-Math mirror on GitHub for ten of the twelve sets (one uniform
+jsonl schema) and `math-ai/aime{25,26}` for the two AIME years it does not carry.
+Everything is plain jsonl over urllib, so this script needs **no third-party
+packages** -- not `datasets`, not `pandas`/`pyarrow`. That is deliberate: a parquet
+source previously made `aime-2024` the only set that could fail on a machine without
+pyarrow, which is exactly the headline benchmark you least want to lose.
 """
 
 from __future__ import annotations
@@ -72,12 +76,6 @@ def _fetch_jsonl(url: str) -> list[dict]:
         if line:
             rows.append(json.loads(line))
     return rows
-
-
-def _fetch_parquet(url: str) -> list[dict]:
-    import pandas as pd
-
-    return pd.read_parquet(url).to_dict("records")
 
 
 def _qwen(name: str) -> list[dict]:
@@ -123,13 +121,14 @@ def _choices_block(choices: dict[str, str]) -> str:
 # `label` is always a string, gradable by miles' `math` reward.
 
 
-def _conv_aime24(r: dict) -> tuple[str, str, dict]:
-    # math-ai/aime24 stores the answer as `solution = "\boxed{204}"`.
-    return r["problem"].strip(), (_boxed(r["solution"]) or r["solution"]).strip(), {}
-
-
 def _conv_aime(r: dict) -> tuple[str, str, dict]:
-    return r["problem"].strip(), str(r["answer"]).strip(), {}
+    # AIME answers are integers 0-999. The Qwen mirror zero-pads them to three
+    # digits ("025", "073"); strip that so the stored label is the plain integer.
+    # The grader normalises either form, so this is tidiness, not correctness.
+    label = str(r["answer"]).strip()
+    if label.isdigit():
+        label = str(int(label))
+    return r["problem"].strip(), label, {}
 
 
 def _conv_gsm8k(r: dict) -> tuple[str, str, dict]:
@@ -204,11 +203,7 @@ def _conv_sat_math(r: dict) -> tuple[str, str, dict]:
 # -------------------------------------------------------------------- registry
 
 DATASETS: dict[str, dict] = {
-    "aime-2024": dict(
-        loader=lambda: _fetch_parquet(HF_RESOLVE.format(repo="math-ai/aime24", path="test-00000-of-00001.parquet")),
-        conv=_conv_aime24,
-        n=30,
-    ),
+    "aime-2024": dict(loader=lambda: _qwen("aime24"), conv=_conv_aime, n=30),
     "aime-2025": dict(
         loader=lambda: _fetch_jsonl(HF_RESOLVE.format(repo="math-ai/aime25", path="test.jsonl")),
         conv=_conv_aime,

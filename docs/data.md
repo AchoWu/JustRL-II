@@ -63,7 +63,7 @@ problem, T=1.0, top-p 0.95, 126976-token budget (`justrl2/eval.py`).
 
 | set | problems | kind | source |
 |---|---|---|---|
-| `aime-2024` | 30 | math | `math-ai/aime24` (answer is in `solution` as `\boxed{...}`) |
+| `aime-2024` | 30 | math | Qwen2.5-Math mirror (`aime24`) |
 | `aime-2025` | 30 | math | `math-ai/aime25` |
 | `aime-2026` | 30 | math | `math-ai/aime26` |
 | `olympiadbench` | 675 | math | Qwen2.5-Math mirror; `final_answer[0]`, `$` stripped |
@@ -76,11 +76,18 @@ problem, T=1.0, top-p 0.95, 126976-token budget (`justrl2/eval.py`).
 | `mmlu-stem` | 3018 | **mc** | Qwen2.5-Math mirror, 18 STEM subjects (4 options) |
 | `sat-math` | 32 | **mc** | Qwen2.5-Math mirror (4 options) |
 
-11,686 problems total. Nine come from the
+11,686 problems total. Ten come from the
 [Qwen2.5-Math](https://github.com/QwenLM/Qwen2.5-Math) evaluation mirror — one uniform
-jsonl schema, no `datasets` dependency, and the surface form these benchmarks are
-conventionally reported in. The question/answer shaping follows that harness'
-`parser.py` (`parse_question` / `parse_ground_truth`).
+jsonl schema and the surface form these benchmarks are conventionally reported in; the
+question/answer shaping follows that harness' `parser.py` (`parse_question` /
+`parse_ground_truth`). Only AIME 2025/2026, which the mirror does not carry, come from
+the Hub (`math-ai/aime25`, `math-ai/aime26`).
+
+Everything is plain jsonl fetched with `urllib`, so `prepare_eval_data.py` needs **no
+third-party packages** — no `datasets`, no `pandas`/`pyarrow`. AIME 2024 was briefly
+read from a parquet file, which made it the one set that failed on a host without
+pyarrow; that is the benchmark you least want to silently lose, so it now comes from
+the mirror's jsonl like the rest.
 
 Minerva Math is 272 problems, and that is the whole set — not a truncation. It is the
 OCW/MIT undergraduate STEM slice from the Minerva paper, and five independent mirrors
