@@ -110,9 +110,11 @@ Three things about it are load-bearing and easy to get wrong:
   grades 0 against every label, so the score goes to ~0 regardless of the reasoning.
 - **`--preset` is the training length, not a free knob.** It sets `max_new_tokens` +
   `context_len` (`16k`/`32k`/`128k` = the three configs). Auto-guessed from the
-  checkpoint path, since every `EXP_TAG` carries its length. Evaluating a 16k-trained
-  policy with a 128k budget asks for lengths it never produced; the reverse truncates
-  mid-derivation.
+  checkpoint path, since every `EXP_TAG` carries its length, and falls back to `16k`
+  to match `run_train.sh`'s own default. Evaluating a 16k-trained policy with a 128k
+  budget asks for lengths it never produced; the reverse truncates mid-derivation.
+  The header line prints which preset was used and whether it was explicit, guessed
+  or the fallback — check it rather than assuming.
 - **Multiple choice gets letter-or-text credit.** MMLU-STEM / SAT-Math are
   labelled with a letter, but boxing the correct option *text* is just as right and
   the string grader would score it 0. Rows carry `metadata.kind="mc"` +

@@ -5,9 +5,9 @@
     # all 12 benchmarks, 32 samples each
     python justrl2/eval_benchmarks.py --model runs/<EXP_TAG>/hf/iter_0000499
 
-    # a subset, fewer samples, 16k-trained checkpoint
+    # a subset, fewer samples
     python justrl2/eval_benchmarks.py --model runs/<EXP_TAG>/hf/iter_0000499 \
-        --datasets aime-2024,aime-2025,aime-2026,gsm8k --n 8 --preset 16k
+        --datasets aime-2024,aime-2025,aime-2026,gsm8k --n 8
 
 Metric: **pass@1 estimated from n independent samples** — for each problem the
 fraction of its n samples that are correct, averaged over problems. That is the
@@ -25,13 +25,15 @@ script rather than an ad-hoc harness:
 | answer format  | boxed suffix   | baked into every training `query`; `prepare_eval_data.py` re-appends it |
 | temperature    | 1.0            | `ROLLOUT_TEMPERATURE` / `EVAL_TEMPERATURE`       |
 | top_p          | 0.95           | `EVAL_TOP_P` (training *rollout* uses 1.0; the released AIME numbers use 0.95) |
-| max_new_tokens | 30720 (32k)    | `ROLLOUT_MAX_RESPONSE_LEN` of the chosen preset  |
+| max_new_tokens | 14336 (16k)    | `ROLLOUT_MAX_RESPONSE_LEN` of the chosen preset  |
 | grader         | `math` reward  | `--rm-type math` -> `grade_answer_union`         |
 
 `--preset` must match the config the checkpoint was *trained* with, because the
 response-length cap is not a free parameter here: a 16k-trained policy evaluated
 with a 128k budget is being asked for lengths it never produced, and a 128k-trained
 one evaluated at 16k gets truncated mid-derivation. `--max-tokens` overrides it.
+It is guessed from the checkpoint path (every EXP_TAG carries its length) and falls
+back to `16k`, matching `run_train.sh`'s own default config.
 
 Needs SGLang importable (the community image) and one GPU (more with --tp).
 """
@@ -187,7 +189,7 @@ def main() -> None:
         "--preset",
         choices=sorted(PRESETS),
         default=None,
-        help="training length config; default = guessed from the checkpoint path, else 32k",
+        help="training length config; default = guessed from the checkpoint path, else 16k",
     )
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
@@ -218,7 +220,7 @@ def main() -> None:
     preset_source = "explicit"
     if args.preset is None:
         detected = _detect_preset(args.model)
-        args.preset, preset_source = (detected, "from path") if detected else ("32k", "default")
+        args.preset, preset_source = (detected, "from path") if detected else ("16k", "default")
 
     max_tokens = args.max_tokens if args.max_tokens is not None else PRESETS[args.preset][0]
     context_len = args.context_len if args.context_len is not None else PRESETS[args.preset][1]
