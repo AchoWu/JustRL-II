@@ -11,11 +11,17 @@ Needs no GPU and no sglang. The `__main__` guard and the plain `import
 eval_benchmarks` (rather than a spec load under an ad-hoc name) are both required:
 the grader's ProcessPoolExecutor uses spawn on Windows, so every worker re-imports
 this module and must be able to import the module that `_grade_task` lives in.
+
+The fake engine must be deterministic across runs, since the last check re-runs the
+whole eval with serial grading and demands identical numbers. It therefore derives
+every response from a hash of the request (`_det`) rather than the global RNG -- the
+pool uses fork on Linux, which perturbs that global state and made the two passes
+disagree. See `_det`.
 """
 
 import collections
+import hashlib
 import json
-import random
 import sys
 import types
 from pathlib import Path
@@ -29,12 +35,30 @@ def boxed(x):
     return "reasoning... " + BS + "boxed{" + str(x) + "}"
 
 
+def _det(seed: str) -> float:
+    """A stable pseudo-random float in [0,1) derived only from `seed`.
+
+    Deliberately NOT `random.random()`: the response a fake request gets must
+    depend on nothing but that request. The global RNG is shared mutable state,
+    and the grader's ProcessPoolExecutor uses fork on Linux (spawn on Windows),
+    so a worker can perturb it between the two runs this harness compares --
+    which showed up as the two passes disagreeing on pass@1 and even on the
+    no-box rate. blake2b keeps it platform- and call-order-independent.
+    """
+    h = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big") / 2**64
+
+
 class FakeEngine:
     last = None
 
     def __init__(self, **kw):
         self.kw = kw
         self.calls = []
+        # Per-engine request counter. A fresh FakeEngine is built per run(), so the
+        # k-th request of one run always sees the same counter value as the k-th of
+        # the next -- that is what makes the two runs comparable.
+        self._i = 0
         FakeEngine.last = self
 
     def generate(self, prompts, sampling):
@@ -45,7 +69,11 @@ class FakeEngine:
             gold = p.split("<<GOLD:")[1].split(">>")[0]
             mode = p.split("<<MODE:")[1].split(">>")[0]
             text = p.split("<<TEXT:")[1].split(">>")[0]
-            r = random.random()
+            # The engine is asked for n samples of the same prompt, so the prompt
+            # alone cannot distinguish them. Mix in a per-call counter to get n
+            # different responses while staying deterministic across runs.
+            self._i += 1
+            r = _det(f"{p}#{self._i}")
             if mode == "mc_text":
                 body = boxed(text)  # always answers with the option TEXT, never the letter
             elif r < 0.5:
@@ -58,7 +86,7 @@ class FakeEngine:
                 {
                     "text": body,
                     "meta_info": {
-                        "completion_tokens": random.randint(50, 500),
+                        "completion_tokens": 50 + int(_det(f"len{p}#{self._i}") * 450),
                         "finish_reason": {"type": "length" if r > 0.95 else "stop"},
                     },
                 }
@@ -109,7 +137,6 @@ import eval_benchmarks as mod  # noqa: E402  (must follow the stubs above)
 
 
 def run(data_dir: Path, workers: int, out: str, summary: str):
-    random.seed(0)
     sys.argv = [
         "eval_benchmarks.py",
         "--model",
@@ -189,14 +216,20 @@ if __name__ == "__main__":
         assert res[name]["no_boxed_answer"] > 0.1, name
     print("monotonicity pass@1 <= pass@n and no-box accounting OK")
 
-    # Serial grading must reproduce the parallel numbers exactly.
+    # Serial grading must reproduce the parallel numbers exactly. The fake engine is
+    # deterministic (see _det), so the two runs see byte-identical responses and any
+    # difference is the grader's fault -- which is the whole point of the comparison.
     print("\n--- re-running with --grader-workers 1 ---")
     recs1, s1 = run(DATA, 1, "/tmp/_rec1.jsonl", "/tmp/_sum1.json")
+    assert [r["response"] for r in recs] == [r["response"] for r in recs1], (
+        "the fake engine is not deterministic across runs; the grader comparison below " "would be meaningless"
+    )
     res1 = {r["dataset"]: r for r in s1["results"]}
     for name in res:
         for k in ("pass_at_1", "pass_at_n", "maj_at_n", "solved_all", "no_boxed_answer"):
             assert res[name][k] == res1[name][k], (name, k, res[name][k], res1[name][k])
     assert [r["correct"] for r in recs] == [r["correct"] for r in recs1]
-    print("parallel grading == serial grading, exactly")
+    assert [r["answer"] for r in recs] == [r["answer"] for r in recs1]
+    print("parallel grading == serial grading, exactly (on identical responses)")
 
     print("\nALL MOCK CHECKS PASSED")
