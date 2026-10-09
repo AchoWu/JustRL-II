@@ -55,6 +55,55 @@ a single repo, `prepare_data.py --eval-repo <repo> --eval-splits aime2024,aime20
 converts them for you. The reported numbers use 30 problems per year, 16 samples per
 problem, T=1.0, top-p 0.95, 126976-token budget (`justrl2/eval.py`).
 
+## The broader eval suite — 12 math/STEM benchmarks
+
+`python justrl2/prepare_eval_data.py` downloads and converts twelve sets into
+`datasets/eval/<name>.jsonl`, with the same `prompt` / `label` schema, for
+`justrl2/eval_benchmarks.py`:
+
+| set | problems | kind | source |
+|---|---|---|---|
+| `aime-2024` | 30 | math | `math-ai/aime24` (answer is in `solution` as `\boxed{...}`) |
+| `aime-2025` | 30 | math | `math-ai/aime25` |
+| `aime-2026` | 30 | math | `math-ai/aime26` |
+| `olympiadbench` | 675 | math | Qwen2.5-Math mirror; `final_answer[0]`, `$` stripped |
+| `gsm8k` | 1319 | math | Qwen2.5-Math mirror; label after `####` |
+| `minerva-math` | 272 | math | Qwen2.5-Math mirror; `\boxed{}` out of `solution` (272/272 have one) |
+| `svamp` | 1000 | math | body + question concatenated |
+| `asdiv` | 2215 | math | body + question; the `(apples)` unit is stripped from the label |
+| `mawps` | 2065 | math | `input` / `target` |
+| `tabmwp` | 1000 | math | table prepended to the question; numeric labels canonicalised |
+| `mmlu-stem` | 3018 | **mc** | Qwen2.5-Math mirror, 18 STEM subjects (4 options) |
+| `sat-math` | 32 | **mc** | Qwen2.5-Math mirror (4 options) |
+
+11,686 problems total. Nine come from the
+[Qwen2.5-Math](https://github.com/QwenLM/Qwen2.5-Math) evaluation mirror — one uniform
+jsonl schema, no `datasets` dependency, and the surface form these benchmarks are
+conventionally reported in. The question/answer shaping follows that harness'
+`parser.py` (`parse_question` / `parse_ground_truth`).
+
+Minerva Math is 272 problems, and that is the whole set — not a truncation. It is the
+OCW/MIT undergraduate STEM slice from the Minerva paper, and five independent mirrors
+(`math-ai/minervamath`, `svc-huggingface/minerva-math`, `zwhe99/simplerl-minerva-math`,
+`1231czx/minerva_math`, `nanoverl/minerva`) all carry exactly 272 rows over the same
+problems. Any "1000-problem Minerva" is a different benchmark — most likely MATH-500
+or the 1000-row TabMWP/SVAMP subsets, which are separate entries above.
+
+Two things the conversion does beyond reformatting:
+
+1. **It appends the training answer instruction.** Every `prompt` ends with
+   `\nPlease reason step by step, and put your final answer within \boxed{}.` because
+   every training `query` does (5988/5988 checked rows) and the grader needs a
+   `\boxed{}` to extract anything. The raw problem stays in `question`, so
+   `--no-answer-suffix` ablates it without re-downloading.
+2. **Multiple-choice rows keep their options.** `metadata.kind = "mc"` and
+   `metadata.choices` (letter -> option text) let the eval credit a response that
+   boxes the correct option *text* rather than the letter — same answer, and the label
+   is the letter. Everything else is `kind = "math"`.
+
+`--datasets a,b,c` restricts the download; existing files are skipped unless
+`--overwrite`.
+
 ## Using your own data
 
 Any jsonl with `prompt` and `label` works:

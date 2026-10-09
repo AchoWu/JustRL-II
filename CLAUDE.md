@@ -84,6 +84,53 @@ python justrl2/eval.py --model runs/<EXP_TAG>/hf/iter_0000299 \
     --n 16 --temperature 1.0 --top-p 0.95 --max-tokens 126976
 ```
 
+Multi-benchmark eval (12 math/STEM sets, pass@1 from n independent samples):
+```bash
+python justrl2/prepare_eval_data.py          # -> datasets/eval/*.jsonl (one-time, 11,686 problems)
+python justrl2/eval_benchmarks.py --model runs/<EXP_TAG>/hf/iter_0000499 --n 32
+# subset / smoke:
+python justrl2/eval_benchmarks.py --model runs/<EXP_TAG>/hf/iter_0000499 \
+    --datasets aime-2024,aime-2025,aime-2026 --n 8 --limit 5
+```
+`eval.py` stays the minimal AIME-only path; `eval_benchmarks.py` is the suite
+(AIME 2024/25/26, OlympiadBench, GSM8K, Minerva Math, SVAMP, ASDiv, MAWPS, TabMWP,
+MMLU-STEM, SAT-Math) and reports `pass@1` with a Wilson 95% half-width, plus
+`pass@n` / `maj@n` / truncation / no-box rate as diagnostics.
+
+Three things about it are load-bearing and easy to get wrong:
+
+- **The prompt must carry the boxed instruction.** Every row of the training corpus
+  ends with the literal line `Please reason step by step, and put your final answer
+  within \boxed{}.` (checked: 5988/5988 rows of `Math_part-1-of-4.jsonl`), inside
+  `query` — so inside the *user turn*, not a system prompt. `JustRL-II-base-model`'s
+  `chat_template.jinja` emits a `<|im_start|>system` block only if the caller supplies
+  one, and `train.sh` supplies none. `prepare_eval_data.py` re-appends that exact line
+  into `prompt` and keeps the bare problem in `question`. Drop it and the grader
+  collapses: `extract_answer` returns None without a `\boxed{}`, and a None extraction
+  grades 0 against every label, so the score goes to ~0 regardless of the reasoning.
+- **`--preset` is the training length, not a free knob.** It sets `max_new_tokens` +
+  `context_len` (`16k`/`32k`/`128k` = the three configs). Auto-guessed from the
+  checkpoint path, since every `EXP_TAG` carries its length. Evaluating a 16k-trained
+  policy with a 128k budget asks for lengths it never produced; the reverse truncates
+  mid-derivation.
+- **Multiple choice gets letter-or-text credit.** MMLU-STEM / SAT-Math are
+  labelled with a letter, but boxing the correct option *text* is just as right and
+  the string grader would score it 0. Rows carry `metadata.kind="mc"` +
+  `metadata.choices`; `--no-mc-value-credit` reverts to letter-only.
+
+Grading is parallelised because it is not cheap: a *failing* grade falls through
+sympy into the math-verify subprocess fallback (~160 ms measured), so the suite at
+n=32 would otherwise spend hours in the grader. Samples are deduped by
+(problem, boxed answer) and fanned out over `--grader-workers` processes — processes,
+not threads, because `math_verify_fallback` picks "first worker whose lock is free"
+without holding a lock across the check, so threads all pile onto worker[0] (measured
+1.1x vs 2.6x). Verified bit-identical to serial grading.
+
+Verify the eval plumbing without a GPU (fake engine + tokenizer; needs the jsonl):
+```bash
+python tests/fast/mock_eval_benchmarks_check.py datasets/eval
+```
+
 Score with the critic. It has **no HF export** — `_should_save_hf` in `actor.py`
 returns `False` for `role != "actor"` — and it does not need one: this reads the dist
 checkpoint directly and writes nothing.
