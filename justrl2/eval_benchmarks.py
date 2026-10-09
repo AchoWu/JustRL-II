@@ -202,6 +202,11 @@ def main() -> None:
     ap.add_argument("--mem-fraction", type=float, default=0.85)
     ap.add_argument("--max-running-requests", type=int, default=None)
     ap.add_argument("--chunk-size", type=int, default=8192, help="requests per generate() call (memory bound)")
+    ap.add_argument(
+        "--log-level",
+        default="info",
+        help="SGLang engine log level; 'warning' silences the weight-load progress bars",
+    )
     ap.add_argument("--out", default=None, help="write per-sample records to this jsonl")
     ap.add_argument("--summary", default=None, help="write the summary table to this json")
     ap.add_argument(
@@ -272,6 +277,15 @@ def main() -> None:
     )
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+
+    # Loading the engine is the longest unexplained wait in a run: the weights have to
+    # be read and sharded before a single GPU does any work, and with --dp N every
+    # replica loads its own copy. `log_level="warning"` hid SGLang's progress bars and
+    # made that look like a hang, so default to "info" and keep a knob to quiet it.
+    # A `pytorch_model.bin` (pickle) is the slow case -- it cannot be mmap'd the way
+    # safetensors can, so each replica deserialises the full file.
+    print(f"loading engine (tp={args.tp}, dp={args.dp}) -- weight load dominates startup ...", flush=True)
+    t_load = time.time()
     engine_kwargs = dict(
         model_path=args.model,
         trust_remote_code=True,
@@ -283,11 +297,12 @@ def main() -> None:
         # train.sh feeds the context length to max_position_embeddings the same way;
         # without it a model whose config caps at 4k silently truncates long prompts.
         json_model_override_args=json.dumps({"max_position_embeddings": context_len}),
-        log_level="warning",
+        log_level=args.log_level,
     )
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
     engine = sgl.Engine(**engine_kwargs)
+    print(f"engine ready in {time.time() - t_load:.0f}s\n", flush=True)
 
     sampling = {
         "temperature": args.temperature,
@@ -340,8 +355,13 @@ def main() -> None:
         flat = [p for p in prompts for _ in range(args.n)]
 
         outputs: list[dict] = []
-        for start in range(0, len(flat), args.chunk_size):
-            outputs.extend(engine.generate(flat[start : start + args.chunk_size], sampling))
+        n_chunks = (len(flat) + args.chunk_size - 1) // args.chunk_size
+        for ci, start in enumerate(range(0, len(flat), args.chunk_size)):
+            chunk = flat[start : start + args.chunk_size]
+            tag = f" chunk {ci + 1}/{n_chunks}" if n_chunks > 1 else ""
+            print(f"  {name}: generating {len(chunk)} requests{tag} ...", flush=True)
+            outputs.extend(engine.generate(chunk, sampling))
+        print(f"  {name}: generated in {time.time() - t0:.0f}s, grading ...", flush=True)
 
         per_problem: list[list[bool]] = [[] for _ in rows]
         answers: list[list[str]] = [[] for _ in rows]
